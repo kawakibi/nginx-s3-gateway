@@ -12,6 +12,14 @@
 
 ## Configuration
 
+The following environment variables are used to configure the handling of dynamic bucket names via a header
+
+| Name                                  | Required? | Allowed Values               | Default             | Description                                                                                 |
+| ------------------------------------- | --------- | ---------------------------- | ------------------- | ------------------------------------------------------------------------------------------- |
+| `ALLOW_DYNAMIC_BUCKET_NAME`              | Yes       | `true`, `false`              | `false`             | Flag enabling dynamic bucket name via header                                                |
+| `HEADER_DYNAMIC_BUCKET_NAME`       | No        |                              | `X-Bucket-Name`     | Header Name for Getting Bucket name                                                         |
+
+
 The following environment variables are used to configure the gateway when
 running as a Container or as a Systemd service.
 

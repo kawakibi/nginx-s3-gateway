@@ -33,4 +33,6 @@ S3 Backend Environment:
   CORS Enabled: ${CORS_ENABLED}
   CORS Allow Private Network Access: ${CORS_ALLOW_PRIVATE_NETWORK_ACCESS}
   Proxy cache using stale setting: ${PROXY_CACHE_USE_STALE}
+  Dynamic Bucket Name Enabled: ${ALLOW_DYNAMIC_BUCKET_NAME}
+  Dynamic Bucket Name Source Header: ${HEADER_DYNAMIC_BUCKET_NAME}
 EOM

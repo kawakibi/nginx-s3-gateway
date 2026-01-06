@@ -32,6 +32,7 @@ import awssig2 from "./awssig2.js";
 import awssig4 from "./awssig4.js";
 import utils from "./utils.js";
 
+_requireEnvVars('ALLOW_DYNAMIC_BUCKET_NAME');
 _requireEnvVars('S3_BUCKET_NAME');
 _requireEnvVars('S3_SERVER');
 _requireEnvVars('S3_SERVER_PROTO');
@@ -193,7 +194,7 @@ function s3date(r) {
  * @returns {string} AWS authentication signature
  */
 function s3auth(r) {
-    const bucket = process.env['S3_BUCKET_NAME'];
+    const bucket = getBucketName(r);
     const region = process.env['S3_REGION'];
     const host = r.variables.s3_host;
     const sigver = process.env['AWS_SIGS_VERSION'];
@@ -282,7 +283,7 @@ function _s3ReqParamsForSigV4(r, bucket, host) {
  * @returns {string} start of the file path for the S3 object URI
  */
 function s3BaseUri(r) {
-    const bucket = process.env['S3_BUCKET_NAME'];
+    const bucket = getBucketName(r);
     let basePath;
 
     if (S3_STYLE === 'path') {
@@ -371,6 +372,16 @@ function redirectToS3(r) {
         utils.debug_log(r, 'Invalid method requested: ' + r.method);
         r.internalRedirect("@error405");
         return;
+    }
+
+    // Validate dynamic bucket name header early if enabled
+    if (utils.parseBoolean(process.env['ALLOW_DYNAMIC_BUCKET_NAME'])) {
+        const bucketName = getBucketName(r);
+        if (!bucketName || bucketName.length === 0) {
+            utils.debug_log(r, `Dynamic bucket name header ${process.env['HEADER_DYNAMIC_BUCKET_NAME'] || 'X-Bucket-Name'} is missing or empty`);
+            r.internalRedirect("@error500");
+            return;
+        }
     }
 
     const uriPath = r.variables.uri_path;
@@ -531,6 +542,26 @@ function _requireEnvVars(envVarName) {
     }
 }
 
+/**
+ * Retrieves the bucket name to use for the request. If dynamic bucket names
+ * are not enabled, the static bucket name from the environment variable is
+ * returned. If dynamic bucket names are enabled, the bucket name is read
+ * from the specified HTTP header.
+ *
+ * @param r {NginxHTTPRequest} HTTP request
+ * @returns {string} bucket name to use for request
+ */
+function getBucketName(r) {
+    if (!utils.parseBoolean(process.env['ALLOW_DYNAMIC_BUCKET_NAME'])) {
+        return process.env['S3_BUCKET_NAME'];
+    }
+
+    const headerName = process.env['HEADER_DYNAMIC_BUCKET_NAME'] || 'X-Bucket-Name';
+    const bucketName = r.headersIn[headerName];
+
+    return bucketName;
+}
+
 export default {
     s3date,
     s3auth,
@@ -540,6 +571,7 @@ export default {
     editHeaders,
     filterListResponse,
     loadContent,
+    getBucketName,
     // These functions do not need to be exposed, but they are exposed so that
     // unit tests can run against them.
     _s3ReqParamsForSigV2,

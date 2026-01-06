@@ -24,7 +24,7 @@ failed=0
 
 required=("S3_BUCKET_NAME" "S3_SERVER" "S3_SERVER_PORT" "S3_SERVER_PROTO"
 "S3_REGION" "S3_STYLE" "ALLOW_DIRECTORY_LIST" "AWS_SIGS_VERSION"
-"CORS_ENABLED")
+"CORS_ENABLED" "ALLOW_DYNAMIC_BUCKET_NAME")
 
 # Require some form of authentication to be configured.
 
