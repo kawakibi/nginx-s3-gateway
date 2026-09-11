@@ -17,15 +17,18 @@
 
 set -eu
 
-parseBoolean() {
-  case "$1" in
-    TRUE | true | True | YES | Yes | 1)
-      echo 1
-      ;;
-    *)
-      echo 0
-      ;;
-  esac
+# Shared boolean parsing helpers (parseBoolean, parseBooleanTristate, ...).
+# Sourced from /etc/nginx rather than /docker-entrypoint.d so the base
+# image's entrypoint never executes it as a script of its own.
+# shellcheck source=common/etc/nginx/gateway_env_lib.sh
+. /etc/nginx/gateway_env_lib.sh
+
+# Prints $1 with all trailing slashes removed ("" stays "").
+trimTrailingSlashes() {
+  while [ "${1%/}" != "$1" ]; do
+    set -- "${1%/}"
+  done
+  printf '%s' "$1"
 }
 
 # This line is an addition to the NGINX Docker image's entrypoint script.
@@ -68,11 +71,20 @@ if [ "${CORS_ALLOWED_ORIGIN+x}" = "" ]; then
   export CORS_ALLOWED_ORIGIN="*"
 fi
 
-# See documentation for this feature. We do not parse this as a boolean
-# since "true" and "false" are the required values of the header this populates
-if [ "${CORS_ALLOW_PRIVATE_NETWORK_ACCESS+x}" != "true" ] && [ "${CORS_ALLOW_PRIVATE_NETWORK_ACCESS+x}" != "false" ]; then
-  export CORS_ALLOW_PRIVATE_NETWORK_ACCESS=""
-fi
+# The rendered value is constrained - cors.conf.template interpolates it
+# straight into the Access-Control-Allow-Private-Network add_header, whose
+# only meaningful values are the literal strings "true" and "false" - but the
+# accepted input is the shared boolean grammar. Parse first, then map the
+# three-way result onto what the header needs: any true spelling renders
+# "true", any false spelling renders "false", and empty (or a spelling
+# 00-check-for-required-env.sh already rejected) stays empty, which makes
+# nginx omit the add_header entirely.
+case "$(parseBooleanTristate "${CORS_ALLOW_PRIVATE_NETWORK_ACCESS:-}")" in
+  1) CORS_ALLOW_PRIVATE_NETWORK_ACCESS="true" ;;
+  0) CORS_ALLOW_PRIVATE_NETWORK_ACCESS="false" ;;
+  *) CORS_ALLOW_PRIVATE_NETWORK_ACCESS="" ;;
+esac
+export CORS_ALLOW_PRIVATE_NETWORK_ACCESS
 
 # This is the primary logic to determine the s3 host used for the
 # upstream (the actual proxying action) as well as the `Host` header
@@ -94,7 +106,58 @@ else
   export S3_HOST_HEADER="${S3_BUCKET_NAME}.${S3_SERVER}"
 fi
 
+# Use the system CA bundle for HTTPS S3 origins unless a private/custom CA
+# bundle is mounted and selected explicitly.
+if [ "${S3_TRUSTED_CERT_PATH+x}" = "" ]; then
+  export S3_TRUSTED_CERT_PATH="/etc/ssl/certs/ca-certificates.crt"
+fi
+
 # Use default proxy_cache_use_stale settings if the variable is not defined
 if [ "${PROXY_CACHE_USE_STALE+x}" = "" ]; then
   export PROXY_CACHE_USE_STALE="error timeout http_500 http_502 http_503 http_504"
 fi
+
+# Normalize PROXY_CACHE_BYPASS_NO_CACHE so the fail-closed map in
+# default.conf.template only ever sees '1' or '0'.
+PROXY_CACHE_BYPASS_NO_CACHE="$(parseBoolean "${PROXY_CACHE_BYPASS_NO_CACHE:-false}")"
+export PROXY_CACHE_BYPASS_NO_CACHE
+
+# Normalize ACCESS_LOG_CACHE_STATUS and derive the log-format fragment that
+# gateway/logging.conf.template interpolates: a trailing
+# ' "$upstream_cache_status"' field when enabled, empty otherwise so the
+# rendered format stays byte-identical to the historical one. The single
+# quotes matter: the fragment must reach the template renderer with a literal
+# $upstream_cache_status for nginx to evaluate. Both exports reach the
+# template renderer later in the entrypoint loop but not the nginx master
+# (this script runs in the entrypoint's pipeline subshell); njs never reads
+# either variable, so nginx.conf deliberately omits their env directives.
+ACCESS_LOG_CACHE_STATUS="$(parseBoolean "${ACCESS_LOG_CACHE_STATUS:-false}")"
+export ACCESS_LOG_CACHE_STATUS
+# shellcheck disable=SC2089,SC2090 # the embedded quotes are data, not shell
+# quoting: envsubst renders them into the nginx log format.
+if [ "${ACCESS_LOG_CACHE_STATUS}" = "1" ]; then
+  export ACCESS_LOG_CACHE_STATUS_FIELD=' "$upstream_cache_status"'
+else
+  export ACCESS_LOG_CACHE_STATUS_FIELD=""
+fi
+
+# Normalize STRIP_LEADING_DIRECTORY_PATH and PREFIX_LEADING_DIRECTORY_PATH for
+# the request-path map in default.conf.template, which concatenates
+# $PREFIX_LEADING_DIRECTORY_PATH with paths that always begin with "/": a
+# trailing slash would produce double-slash S3 keys and 404 every request
+# (GH-576). PREFIX also gains a leading slash if missing; STRIP is a regex
+# fragment, so only its trailing slashes are trimmed. Note: the entrypoint
+# runs the whole /docker-entrypoint.d loop in a pipeline subshell, so these
+# exports reach the later entrypoint scripts (including the template renderer)
+# but NOT the exec'd nginx master - nginx.conf therefore deliberately omits
+# `env` directives for these variables so njs can never read the raw,
+# un-normalized values from process.env.
+PREFIX_LEADING_DIRECTORY_PATH="$(trimTrailingSlashes "${PREFIX_LEADING_DIRECTORY_PATH:-}")"
+case "${PREFIX_LEADING_DIRECTORY_PATH}" in
+  "" | /*) ;;
+  *) PREFIX_LEADING_DIRECTORY_PATH="/${PREFIX_LEADING_DIRECTORY_PATH}" ;;
+esac
+export PREFIX_LEADING_DIRECTORY_PATH
+
+STRIP_LEADING_DIRECTORY_PATH="$(trimTrailingSlashes "${STRIP_LEADING_DIRECTORY_PATH:-}")"
+export STRIP_LEADING_DIRECTORY_PATH

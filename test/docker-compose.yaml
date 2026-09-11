@@ -1,23 +1,30 @@
 services:
   nginx-s3-gateway:
-    # If minio client is up and running properly, we are reasonably sure that
-    # minio has properly started. That's why we depend on it here.
+    # The healthcheck proves the origin's HTTP listener is up (/health only:
+    # RustFS's IAM subsystem can lag behind it and briefly reject
+    # authenticated S3 calls with "waiting for iam"), so waiting on it keeps
+    # the gateway from racing the origin's startup but does not guarantee the
+    # first S3 call succeeds - run_integration_tests.sh additionally gates
+    # seeding on an authenticated request (see seed_origin_data).
     depends_on:
-      minio:
+      rustfs:
         condition: service_healthy
     image: "nginx-s3-gateway"
     ports:
       - "8989:${NGINX_INTERNAL_PORT-80}/tcp"
+    volumes:
+      - "${TEST_TLS_CERT_DIR:-/tmp/nginx-s3-gateway-test-certs}:/etc/nginx/test-certs:ro"
     links:
-      - "minio"
+      - "rustfs"
     restart: "no"
     environment:
       S3_BUCKET_NAME: "bucket-1"
       AWS_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE"
       AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-      S3_SERVER: "minio"
-      S3_SERVER_PORT: "9000"
-      S3_SERVER_PROTO: "http"
+      S3_SERVER: "${TEST_S3_SERVER:-rustfs}"
+      S3_SERVER_PORT: "${TEST_S3_SERVER_PORT:-9000}"
+      S3_SERVER_PROTO: "${TEST_S3_SERVER_PROTO:-http}"
+      S3_TRUSTED_CERT_PATH: "${TEST_S3_TRUSTED_CERT_PATH:-/etc/ssl/certs/ca-certificates.crt}"
       S3_REGION: "us-east-1"
       DEBUG: "true"
       S3_STYLE: "${S3_STYLE:-virtual-v2}"
@@ -27,42 +34,60 @@ services:
       APPEND_SLASH_FOR_POSSIBLE_DIRECTORY:
       STRIP_LEADING_DIRECTORY_PATH:
       PREFIX_LEADING_DIRECTORY_PATH:
+      DIRECTORY_LISTING_PAGE_SIZE: "${DIRECTORY_LISTING_PAGE_SIZE:-}"
       AWS_SIGS_VERSION:
       STATIC_SITE_HOSTING:
       PROXY_CACHE_MAX_SIZE: "10g"
-      PROXY_CACHE_SLICE_SIZE: "1m"
+      PROXY_CACHE_SLICE_SIZE: "${TEST_PROXY_CACHE_SLICE_SIZE:-1m}"
       PROXY_CACHE_INACTIVE: "60m"
       PROXY_CACHE_VALID_OK: "1h"
       PROXY_CACHE_VALID_NOTFOUND: "1m"
       PROXY_CACHE_VALID_FORBIDDEN: "30s"
-      NGINX_LICENSE_JWT: "${NGINX_LICENSE_JWT}"
+      PROXY_CACHE_BYPASS_NO_CACHE:
+      PROXY_CACHE_IGNORE_HEADERS:
+      ACCESS_LOG_CACHE_STATUS:
+      # Interpolated with defaults rather than bare pass-through keys: a bare
+      # key whose variable is unset in the invoking shell reaches the
+      # container as an EMPTY value, which overrides the image's
+      # ENV CORS_ENABLED=0 and fails the required-env startup check. The
+      # CORS integration leg overrides both on its compose command line.
+      CORS_ENABLED: "${CORS_ENABLED:-false}"
+      CORS_ALLOWED_ORIGIN: "${CORS_ALLOWED_ORIGIN:-*}"
+      CORS_ALLOW_PRIVATE_NETWORK_ACCESS: "${CORS_ALLOW_PRIVATE_NETWORK_ACCESS:-}"
+      IPV6_ENABLED:
+      NGINX_LICENSE_JWT: "${NGINX_LICENSE_JWT-}"
 
-  minio:
-    image: quay.io/minio/minio:RELEASE.2023-06-09T07-32-12Z
-    hostname: bucket-1.minio
+  rustfs:
+    image: rustfs/rustfs:1.0.0-rc.3@sha256:800cf3f352a0a27e3275ca854a51f0027975d7acc7a0d52089a35bcc9fcbf0b5
+    hostname: bucket-1.rustfs
+    networks:
+      default:
+        aliases:
+          - rustfs-mismatch
     ports:
       - "9090:9000/tcp"
     restart: "no"
-    command: minio server /data
+    volumes:
+      - "${TEST_TLS_CERT_DIR:-/tmp/nginx-s3-gateway-test-certs}:/tls:ro"
     environment:
-      MINIO_ADDRESS: :9000
-      MINIO_ROOT_USER: "AKIAIOSFODNN7EXAMPLE"
-      MINIO_ROOT_PASSWORD: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-      MINIO_REGION_NAME: "us-east-1"
-      MINIO_DOMAIN: "minio"
-      MINIO_BROWSER: "off"
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_ACCESS_KEY: "AKIAIOSFODNN7EXAMPLE"
+      RUSTFS_SECRET_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+      RUSTFS_REGION: "us-east-1"
+      # RustFS suffix-matches the raw Host header against this list to parse
+      # virtual-hosted-style bucket names, so both forms are needed: the
+      # gateway's 'virtual-v2' style sends Host: bucket-1.rustfs:9000 (port
+      # included) while 'virtual' sends Host: bucket-1.rustfs.
+      RUSTFS_SERVER_DOMAINS: "rustfs:9000,rustfs"
+      RUSTFS_CONSOLE_ENABLE: "false"
+      # Empty means plain HTTP. RustFS refuses to start when the path is set
+      # but missing or holds no rustfs_cert.pem/rustfs_key.pem pair, so the
+      # TLS leg is the only one that may point this at /tls.
+      RUSTFS_TLS_PATH: "${TEST_S3_TLS_PATH:-}"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      # Probes over the same protocol the gateway uses: RustFS terminates TLS
+      # itself, so the one listener is either plain HTTP or HTTPS for both.
+      test: ["CMD-SHELL", "curl -k -f ${TEST_S3_SERVER_PROTO:-http}://localhost:9000/health"]
       interval: 5s
       timeout: 3s
       retries: 3
-  # It may be useful to enable minio client so that you can debug what calls
-  # were made to minio by the gateway.
-#  minio-client:
-#    depends_on:
-#      - "minio"
-#    image: "minio/mc"
-#    restart: "no"
-#    command: "admin trace --verbose nginx-test-gateway"
-#    environment:
-#      MC_HOST_nginx-test-gateway: "http://AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY@minio:9000"

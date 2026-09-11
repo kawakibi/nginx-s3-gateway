@@ -6,24 +6,73 @@ js_import /etc/nginx/include/s3gateway.js;
 # we plan to use.
 include /etc/nginx/conf.d/gateway/v${AWS_SIGS_VERSION}_js_vars.conf;
 
-# Extracts only the path from the requested URI. This strips out all query
-# parameters and anchors in order to prevent extraneous data from being sent
-# to S3.
-map $request_uri $uri_full_path {
-    "~^(?P<path>.*?)(\?.*)*$"  $path;
-}
-
-# Retrieves the initial scheme send by the User Agent. This uses
-# X-Forwarded-Proto header added by possible proxy or load balancer.
-map $http_x_forwarded_proto $real_scheme {
-    default    $http_x_forwarded_proto;
-    ""         $scheme;
-}
+# The client-facing request path: $request_uri with the query string
+# stripped (to prevent extraneous data from being sent to S3) and runs of
+# duplicate literal slashes collapsed (GH-88). Collapsing must happen here,
+# BEFORE the STRIP/PREFIX map below chooses its rewrite arm - a map cannot
+# do a global replace, so this variable is njs-derived.
+js_set $uri_full_path s3gateway.uriFullPath;
 
 # Remove/replace a portion of request URL (if configured)
 map $uri_full_path $uri_path {
 	"~^$STRIP_LEADING_DIRECTORY_PATH(.*)"  $PREFIX_LEADING_DIRECTORY_PATH$1;
     default $PREFIX_LEADING_DIRECTORY_PATH$uri_full_path;
+}
+
+# Detects a 'no-cache' token in the client's Cache-Control request header
+# (sent by browsers on a hard refresh). Token-aware so that substrings of
+# other tokens (e.g. 'x-no-cache-y') do not match. NGINX 1.23.0+ joins
+# repeated Cache-Control headers into one comma-separated value.
+map $http_cache_control $req_cc_no_cache {
+    default                       0;
+    "~*(^|,)\s*no-cache\s*(,|$)"  1;
+}
+
+# PROXY_CACHE_BYPASS_NO_CACHE is normalized to 1/0 by 01-set-defaults.envsh
+# (container) or standalone_ubuntu_oss_install.sh. proxy_cache_bypass treats
+# ANY non-empty value other than '0' as truthy, so this composite match fails
+# closed: only the exact value '1:1' enables a bypass; unnormalized values
+# like 'false' or 'yes' disable it.
+map "${PROXY_CACHE_BYPASS_NO_CACHE}:$req_cc_no_cache" $cache_bypass_no_cache {
+    default  0;
+    "1:1"    1;
+}
+
+# GH-496: whether the request method is one this read-only gateway serves.
+# `location /` rejects every other method in the rewrite phase with an
+# immediate 405 - see the comment there. CORS_ENABLED is normalized to 1/0
+# by 01-set-defaults.envsh (container) or standalone_ubuntu_oss_install.sh.
+# The read methods match on the method alone (regex rows) so an unnormalized
+# CORS_ENABLED value can never take reads down; only OPTIONS - the CORS
+# preflight - requires the exact value '1'. Everything else fails closed.
+# Keep this method set in sync with LIMIT_METHODS_TO/LIMIT_METHODS_TO_CSV
+# (01-set-defaults.envsh and standalone_ubuntu_oss_install.sh): the
+# index.html limit_except and the @error405 Allow header still derive from
+# those, and a change to one side alone would make the gateway 405 methods
+# its own Allow header advertises.
+map "${CORS_ENABLED}:$request_method" $method_not_allowed {
+    default        1;
+    "~:GET$"       0;
+    "~:HEAD$"      0;
+    "1:OPTIONS"    0;
+}
+
+# The Access-Control-Allow-Origin value for the nginx-generated rejection
+# responses in @error404 and @error405. cors.conf's if blocks key on the
+# request method and match only GET/HEAD/OPTIONS, so the non-read methods
+# those locations answer (rewrite-phase 405s per GH-496; the */index.html
+# limit_except denial collapsed to a sanitized 404 per GH-551) would
+# otherwise carry no CORS headers at all, and a cross-origin caller would
+# see an opaque network error instead of the real status. Renders empty
+# when CORS is disabled - add_header omits a header whose value is empty -
+# so CORS-off responses are unchanged, and an operator who explicitly sets
+# CORS_ALLOWED_ORIGIN to "" fails safe the same way. Both variables are
+# guaranteed defined at render time: CORS_ENABLED is normalized to 1/0 and
+# CORS_ALLOWED_ORIGIN defaulted to '*' by 01-set-defaults.envsh (container)
+# or standalone_ubuntu_oss_install.sh.
+map "${CORS_ENABLED}" $cors_error_origin {
+    "1"      "${CORS_ALLOWED_ORIGIN}";
+    default  "";
 }
 
 # S3_HOST_HEADER is set in the startup script
@@ -38,15 +87,28 @@ js_set $s3auth s3gateway.s3auth;
 js_set $awsSessionToken awscredentials.sessionToken;
 js_set $s3uri s3gateway.s3uri;
 js_set $s3_bucket_name s3gateway.getBucketName;
+js_set $trailslash_redirect_uri s3gateway.trailslashRedirectUri;
 
 server {
+    # The IPv6 listen directive is added at container start by
+    # /docker-entrypoint.d/02-ipv6-enable.sh when the runtime kernel supports
+    # IPv6 (or IPV6_ENABLED forces it). The template stays IPv4-only so it is
+    # always a valid configuration on its own: kernels booted with
+    # ipv6.disable=1 cannot bind IPv6 sockets (GH-499), and standalone
+    # installs never run the entrypoint scripts.
     listen       80;
-    listen       [::]:80;
     include /etc/nginx/conf.d/gateway/server_variables.conf;
 
     # Don't display the NGINX version number because we don't want to reveal
     # information that could be used to find an exploit.
     server_tokens off;
+
+    # Emit every nginx-generated redirect as a relative Location so that
+    # request Host and forwarded scheme headers can never choose the redirect
+    # authority - today that is only @trailslash's 302, and this default keeps
+    # any future `return`/`rewrite` redirect safe as well. Location headers
+    # proxied from S3 are not affected.
+    absolute_redirect off;
 
     # Uncomment this for a HTTP header that will let you know the cache status
     # of an object.
@@ -68,7 +130,26 @@ server {
     proxy_cache_background_update on;
     proxy_cache_lock on;
     proxy_cache_use_stale ${PROXY_CACHE_USE_STALE};
-    proxy_cache_key "$request_method$s3_bucket_name$host$uri$is_args$args";
+    # Cache by the effective S3 request identity, not the viewer-controlled
+    # Host header. The version prefix avoids reusing entries written under the
+    # older viewer-Host-based key after an upgrade.
+    proxy_cache_key "s3gw-v2|$request_method|${S3_SERVER_PROTO}://${S3_UPSTREAM}|$s3_host|$s3uri";
+    # Bypass the local cache and re-fetch from S3 when the client sends
+    # Cache-Control: no-cache and PROXY_CACHE_BYPASS_NO_CACHE is enabled.
+    # Opt-in because client-controlled cache busting can be abused to drive
+    # up S3 request costs. The fresh response still refreshes the cache.
+    # Inherited by every location that defines no proxy_cache_bypass of its
+    # own, including @s3 and @s3_sliced.
+    proxy_cache_bypass $cache_bypass_no_cache;
+
+    # Optionally disables NGINX's processing of the caching headers S3 returns,
+    # so that the PROXY_CACHE_VALID_* settings alone decide how long a response
+    # is cached. The file is empty unless PROXY_CACHE_IGNORE_HEADERS is set;
+    # 25-set-proxy-ignore-headers.sh (container) or
+    # standalone_ubuntu_oss_install.sh writes the directive into it at startup.
+    # Kept at server scope so every proxying location inherits it - none of them
+    # define a proxy_ignore_headers of their own, including @s3 and @s3_sliced.
+    include /etc/nginx/conf.d/gateway/proxy_ignore_headers.conf;
 
     # If you need to support proxying range request, refer to this article:
     # https://www.nginx.com/blog/smart-efficient-byte-range-caching-nginx/
@@ -85,10 +166,24 @@ server {
     }
 
     location / {
-        # This value is templated in based on the value of $CORS_ENABLED. When
-        # CORS is enabled, acceptable methods are GET, HEAD, and OPTIONS.
-        # Otherwise, they are GET and HEAD.
-        limit_except ${LIMIT_METHODS_TO} {}
+        # This is a read-only gateway: reject any non-read method in the
+        # rewrite phase with an immediate 405. The server-level
+        # `error_page 405 @error405` adds the Allow header. Rejection happens
+        # before the CORS preflight check below (the map allows OPTIONS when
+        # CORS is enabled), before the credential-fetching auth_request,
+        # before the request body is read, and without ever consulting the
+        # local filesystem. This replaces an empty `limit_except` block:
+        # js_content is not inherited into limit_except contexts, so unlisted
+        # methods fell through to nginx's static module and were answered
+        # from the local docroot - POST returned 404 or 405 depending on
+        # whether the path happened to exist on disk (GH-496). Do not
+        # reintroduce a limit_except alongside this guard: nginx switches
+        # unlisted methods to the limit_except context before the rewrite
+        # phase runs, so this `if` would never execute for exactly the
+        # methods it is meant to reject.
+        if ($method_not_allowed) {
+            return 405;
+        }
 
         # CORS is implemented by returning the appropriate headers as part of
         # the response to an OPTIONS request. If you want to customize the
@@ -98,8 +193,12 @@ server {
 
         auth_request /aws/credentials/retrieve;
 
-        # Redirect to the proper location based on the client request - either
-        # @s3, @s3PreListing or @error405.
+        # Redirect to the proper location based on the client request -
+        # @s3, @s3_sliced, @s3PreListing or @error404. The @error405 branch
+        # in redirectToS3 is defense-in-depth only: the rewrite-phase guard
+        # above already rejects non-read methods, but a customized cors.conf
+        # that stops returning 204 for OPTIONS would otherwise let a
+        # CORS-enabled preflight through to S3 as a signed request.
 
         js_content s3gateway.redirectToS3;
     }
@@ -122,7 +221,16 @@ server {
     location @s3_sliced {
         proxy_cache s3_cache_slices;
         proxy_cache_valid 200 302 206 ${PROXY_CACHE_VALID_OK};
-        proxy_cache_key "$request_method$host$uri$slice_range";
+        # Must mirror the server-level proxy_cache_key exactly, with only
+        # |$slice_range appended: the tuple cannot be single-sourced through a
+        # server-scope `set`, because that would freeze the lazily evaluated
+        # $s3uri before @s3Directory flips $forIndexPage.
+        proxy_cache_key "s3gw-v2|$request_method|${S3_SERVER_PROTO}://${S3_UPSTREAM}|$s3_host|$s3uri|$slice_range";
+        # proxy_cache_bypass is inherited from the server level. A bypassing
+        # ranged request re-fetches only the slices its Range covers, so a
+        # changed object can leave other slices at the previous version until
+        # they expire (the slice module rejects mixed-version responses with
+        # an 'etag mismatch in slice response' error).
 
         slice             ${PROXY_CACHE_SLICE_SIZE};
         proxy_set_header   Range $slice_range;
@@ -145,6 +253,7 @@ server {
         # Enable passing of the server name through TLS Server Name Indication extension.
         proxy_ssl_server_name on;
         proxy_ssl_name ${S3_SERVER};
+        include /etc/nginx/conf.d/gateway/s3_proxy_ssl.conf;
 
         # Set the Authorization header to the AWS Signatures credentials
         proxy_set_header Authorization $s3auth;
@@ -166,6 +275,7 @@ server {
         # results such that we can output an HTML directory contents list.
         xslt_stylesheet /etc/nginx/include/listing.xsl;
         xslt_string_param rootPath '${DIRECTORY_LISTING_PATH_PREFIX}';
+        xslt_string_param prefixPath '${PREFIX_LEADING_DIRECTORY_PATH}';
         xslt_types application/xml;
 
         # We apply an output filter to the XML input received from S3 before it
@@ -206,6 +316,7 @@ server {
         # Enable passing of the server name through TLS Server Name Indication extension.
         proxy_ssl_server_name on;
         proxy_ssl_name ${S3_SERVER};
+        include /etc/nginx/conf.d/gateway/s3_proxy_ssl.conf;
 
         # Set the Authorization header to the AWS Signatures credentials
         proxy_set_header Authorization $s3auth;
@@ -227,6 +338,7 @@ server {
         # results such that we can output an HTML directory contents list.
         xslt_stylesheet /etc/nginx/include/listing.xsl;
         xslt_string_param rootPath '${DIRECTORY_LISTING_PATH_PREFIX}';
+        xslt_string_param prefixPath '${PREFIX_LEADING_DIRECTORY_PATH}';
         xslt_types application/xml;
 
         # We apply an output filter to the XML input received from S3 before it
@@ -244,12 +356,31 @@ server {
         # Comment out this line to receive the error messages returned by S3
         error_page 400 401 402 403 404 405 406 407 408 409 410 411 412 413 414 415 416 417 418 420 422 423 424 426 428 429 431 444 449 450 451 500 501 502 503 504 505 506 507 508 509 510 511 =404 @error404;
 
-        proxy_pass  ${S3_SERVER_PROTO}://storage_urls$s3Uri;
+        proxy_pass  ${S3_SERVER_PROTO}://storage_urls$s3uri;
         include /etc/nginx/conf.d/gateway/s3listing_location.conf;
     }
 
-    location ~ /index.html$ {
+    location ~ /index\.html$ {
         # Configuration for handling locations ending with /index.html
+
+        # This value is templated in based on the CORS_ENABLED setting. When
+        # CORS is enabled, acceptable methods are GET, HEAD, and OPTIONS.
+        # Otherwise, they are GET and HEAD.
+        # An empty limit_except block would not be enough here: nginx
+        # explicitly inherits the proxy_pass content handler into limit_except
+        # contexts, so unlisted methods would still be proxied to S3 with a
+        # valid signature (GH-551). deny all rejects them in the access phase
+        # before anything is sent upstream; the resulting 403 is sanitized to
+        # 404 by the error_page directive below. (`location /` instead rejects
+        # non-read methods in the rewrite phase - see GH-496.)
+        limit_except ${LIMIT_METHODS_TO} {
+            deny all;
+        }
+
+        # Pin the default explicitly: a `satisfy any` inherited from user
+        # customizations (e.g. via s3_server.conf) would let the successful
+        # auth_request below clear the deny's 403 and reopen GH-551.
+        satisfy all;
 
         # Necessary for determining the correct URI to construct.
         set $forIndexPage true;
@@ -262,6 +393,16 @@ server {
         # it to be applied within different contexts.
         include /etc/nginx/conf.d/gateway/cors.conf;
 
+        # nginx regex locations beat the `location /` prefix match, so a
+        # direct request to any `*/index.html` path skips the credential
+        # fetch that happens in `location /`. When running with dynamic
+        # credentials (Pod Identity / IRSA / IMDS / ECS task role), that
+        # means the temporary credential cache is never populated and
+        # signatureV4 crashes with a TypeError dereferencing undefined (#518).
+        # Run the same auth_request sub-request here so fetchCredentials runs
+        # before s3gateway.s3auth evaluates $s3auth.
+        auth_request /aws/credentials/retrieve;
+
         # Don't allow any headers from the client - we don't want them messing
         # with S3 at all.
         proxy_pass_request_headers off;
@@ -269,6 +410,7 @@ server {
         # Enable passing of the server name through TLS Server Name Indication extension.
         proxy_ssl_server_name on;
         proxy_ssl_name ${S3_SERVER};
+        include /etc/nginx/conf.d/gateway/s3_proxy_ssl.conf;
 
         # Set the Authorization header to the AWS Signatures credentials
         proxy_set_header Authorization $s3auth;
@@ -302,7 +444,29 @@ server {
         # it to be applied within different contexts.
         include /etc/nginx/conf.d/gateway/cors.conf;
 
+        # cors.conf only decorates GET and HEAD responses, but this location
+        # also answers non-read methods: the */index.html limit_except
+        # denial is collapsed here to a sanitized 404 (GH-551). Supply the
+        # origin for those from the $cors_error_origin map (empty - header
+        # omitted - when CORS is disabled). No response can carry the header
+        # twice: when a cors.conf if block matches, it declares add_header
+        # directives of its own, and nginx only inherits location-level
+        # add_header directives into a context that declares none.
+        add_header 'Access-Control-Allow-Origin' $cors_error_origin always;
+
         return 404;
+    }
+
+    location @error500 {
+        # The CORS configuration needs to be imported in several places in order for
+        # it to be applied within different contexts.
+        include /etc/nginx/conf.d/gateway/cors.conf;
+
+        # Target of the internal redirect issued by s3gateway.js loadContent
+        # when the index-page probe returns an unexpected status. Without
+        # this location that redirect fails with "could not find named
+        # location" and surfaces an unhandled 500.
+        return 500;
     }
 
     location @trailslashControl {
@@ -312,16 +476,31 @@ server {
     }
 
     location @trailslash {
-        # 302 to request without slashes
-        # Adding a ? to the end of the replacement param in `rewrite` prevents it from
-        # appending the query string.
-        rewrite ^ $real_scheme://$http_host$uri/$is_args$query_string? redirect;
+        # The CORS configuration needs to be imported in several places in order for
+        # it to be applied within different contexts. Without it, a cross-origin
+        # request that gets this 302 would fail the CORS check outright.
+        include /etc/nginx/conf.d/gateway/cors.conf;
+
+        # This redirect stays relative (server-level `absolute_redirect off`)
+        # so request Host and forwarded scheme headers cannot change the
+        # redirect authority. The njs helper preserves the normalized
+        # viewer-facing URI while escaping path bytes that are significant to
+        # browsers or headers; `$uri_path` may contain S3-only rewrites.
+        return 302 $trailslash_redirect_uri/$is_args$query_string;
     }
 
     # Provide a hint to the client on 405 errors of the acceptable request methods
     error_page 405 @error405;
     location @error405 {
         add_header Allow "${LIMIT_METHODS_TO_CSV}" always;
+        # Only non-read methods reach this location (GH-496 rewrite-phase
+        # guard in `location /`; when CORS is off, OPTIONS is one of them),
+        # and cors.conf's if blocks never match those methods, so including
+        # it here would add nothing. Supply the origin directly from the
+        # $cors_error_origin map instead (empty - header omitted - when CORS
+        # is disabled): without it a cross-origin caller sees an opaque CORS
+        # failure rather than this 405 + Allow contract.
+        add_header 'Access-Control-Allow-Origin' $cors_error_origin always;
         return 405;
     }
 

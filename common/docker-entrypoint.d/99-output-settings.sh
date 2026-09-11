@@ -15,17 +15,68 @@
 #  limitations under the License.
 #
 
+# The IPv6 listen directive is injected by 02-ipv6-enable.sh only when the
+# kernel supports IPv6 or IPV6_ENABLED forces it (GH-499), so report the
+# effective rendered state rather than a configuration value.
+if grep -q '^[[:space:]]*listen[[:space:]].*\[::\]' /etc/nginx/conf.d/default.conf 2>/dev/null; then
+  ipv6_listen="enabled"
+else
+  ipv6_listen="disabled"
+fi
+
+# The access key id is not secret, but it is not always in the environment:
+# when it comes from a file (GH-67) report where it was read from instead of
+# printing a blank. The secret key and session token are never reported.
+if [ -n "${AWS_ACCESS_KEY_ID:-}" ]; then
+  access_key_id="${AWS_ACCESS_KEY_ID}"
+elif [ -n "${AWS_ACCESS_KEY_ID_FILE:-}" ]; then
+  access_key_id="(read from ${AWS_ACCESS_KEY_ID_FILE})"
+else
+  access_key_id=""
+fi
+
+if [ "${S3_SERVER_PROTO}" = "https" ]; then
+  origin_tls_verification="enabled"
+else
+  origin_tls_verification="disabled (HTTP origin)"
+fi
+
+# The role ARN is only honored in AssumeRole mode (GH-122), so report the
+# effective state rather than the raw variable. The condition mirrors
+# _isAssumeRoleMode in awscredentials.js, including its third leg: without
+# non-empty static credentials (direct or _FILE form) njs ignores the role
+# ARN and uses the instance credential providers - e.g. with an ECS
+# container credentials URI configured alongside a stray role ARN, the
+# gateway runs on ECS credentials and this banner must not claim otherwise.
+if [ -n "${AWS_ROLE_ARN:-}" ] && [ -z "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] \
+  && { [ -n "${AWS_ACCESS_KEY_ID:-}" ] || [ -n "${AWS_ACCESS_KEY_ID_FILE:-}" ]; } \
+  && { [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] || [ -n "${AWS_SECRET_ACCESS_KEY_FILE:-}" ]; }; then
+  sts_assume_role="enabled (${AWS_ROLE_ARN})"
+else
+  sts_assume_role="disabled"
+fi
+
+# S3_UPSTREAM and S3_HOST_HEADER are computed per S3_STYLE by
+# 01-set-defaults.envsh (sourced by the entrypoint before this script runs),
+# so report those rather than assuming the virtual-host form - path style
+# keeps the bucket out of the hostname entirely (GH-367).
 cat <<EOM
 S3 Backend Environment:
   Service: ${S3_SERVICE:-s3}
-  Access Key ID: ${AWS_ACCESS_KEY_ID}
-  Origin: ${S3_SERVER_PROTO}://${S3_BUCKET_NAME}.${S3_SERVER}:${S3_SERVER_PORT}
+  Access Key ID: ${access_key_id}
+  STS AssumeRole: ${sts_assume_role}
+  Origin: ${S3_SERVER_PROTO}://${S3_UPSTREAM}
+  Host Header: ${S3_HOST_HEADER}
+  Origin TLS Verification: ${origin_tls_verification}
+  Origin TLS Trusted Certificate: ${S3_TRUSTED_CERT_PATH}
   Region: ${S3_REGION}
   Addressing Style: ${S3_STYLE}
   AWS Signatures Version: v${AWS_SIGS_VERSION}
   DNS Resolvers: ${DNS_RESOLVERS}
+  IPv6 Listen: ${ipv6_listen}
   Directory Listing Enabled: ${ALLOW_DIRECTORY_LIST}
   Directory Listing Path Prefix: ${DIRECTORY_LISTING_PATH_PREFIX}
+  Directory Listing Page Size: ${DIRECTORY_LISTING_PAGE_SIZE:-}
   Provide Index Pages Enabled: ${PROVIDE_INDEX_PAGE}
   Append slash for directory enabled: ${APPEND_SLASH_FOR_POSSIBLE_DIRECTORY}
   Stripping the following headers from responses: x-amz-;${HEADER_PREFIXES_TO_STRIP}
@@ -35,4 +86,7 @@ S3 Backend Environment:
   Proxy cache using stale setting: ${PROXY_CACHE_USE_STALE}
   Dynamic Bucket Name Enabled: ${ALLOW_DYNAMIC_BUCKET_NAME}
   Dynamic Bucket Name Source Header: ${HEADER_DYNAMIC_BUCKET_NAME}
+  Proxy cache bypass on Cache-Control no-cache: ${PROXY_CACHE_BYPASS_NO_CACHE}
+  Proxy cache ignoring these S3 response headers: ${PROXY_CACHE_IGNORE_HEADERS}
+  Access log includes upstream cache status: ${ACCESS_LOG_CACHE_STATUS}
 EOM

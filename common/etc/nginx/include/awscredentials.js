@@ -27,16 +27,11 @@
  * @property {string | null} expiration - Expiration timestamp of the credentials
  */
 
-import utils from "./utils.js";
+import awssig4 from "./awssig4.js";
+import utils   from "./utils.js";
 
 const fs = require('fs');
-
-/**
- * The current moment as a timestamp. This timestamp will be used across
- * functions in order for there to be no variations in signatures.
- * @type {Date}
- */
-const NOW = new Date();
+const mod_xml = require('xml');
 
 /**
  * Constant base URI to fetch credentials together with the credentials relative URI, see
@@ -65,6 +60,49 @@ const EC2_IMDS_SECURITY_CREDENTIALS_ENDPOINT = 'http://169.254.169.254/latest/me
 const EKS_POD_IDENTITY_AGENT_CREDENTIALS_ENDPOINT = 'http://169.254.170.23/v1/credentials'
 
 /**
+ * Default IAM role session name used when AWS_ROLE_SESSION_NAME is not set.
+ * The default is applied here rather than in the entrypoint scripts because
+ * variable assignments there cannot reach the nginx master process (the
+ * scripts are executed by the base image entrypoint, not sourced). AWS
+ * constrains RoleSessionName to 2-64 characters matching [\w+=,.@-].
+ * @see {@link https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html | AssumeRole}
+ * @type {string}
+ */
+const DEFAULT_ROLE_SESSION_NAME = 'nginx-s3-gateway';
+
+/**
+ * STS API version sent with the AssumeRole and AssumeRoleWithWebIdentity
+ * calls.
+ * @type {string}
+ */
+const STS_API_VERSION = '2011-06-15';
+
+/**
+ * The STS global endpoint, used when neither STS_ENDPOINT nor the regional
+ * endpoint model selects a more specific one.
+ * @see {@link https://docs.aws.amazon.com/general/latest/gr/sts.html | AWS STS endpoints}
+ * @type {string}
+ */
+const STS_GLOBAL_ENDPOINT = 'https://sts.amazonaws.com';
+
+/**
+ * SigV4 credential-scope region for requests to the STS global endpoint, and
+ * the last-resort signing region for a custom STS_ENDPOINT when neither
+ * AWS_REGION nor S3_REGION is set.
+ * @see {@link https://docs.aws.amazon.com/general/latest/gr/sts.html | AWS STS endpoints}
+ * @type {string}
+ */
+const STS_DEFAULT_SIGNING_REGION = 'us-east-1';
+
+/**
+ * Maximum number of characters of an STS error response body retained in
+ * thrown error messages, so that an unexpectedly large error document cannot
+ * balloon the message; real STS error bodies are far smaller than this.
+ * @type {number}
+ */
+const STS_ERROR_BODY_MAX_LENGTH = 1024;
+
+/**
  * Offset to the expiration of credentials, when they should be considered expired and refreshed. The maximum
  * time here can be 5 minutes, the IMDS and ECS credentials endpoint will make sure that each returned set of credentials
  * is valid for at least another 5 minutes.
@@ -76,6 +114,54 @@ const EKS_POD_IDENTITY_AGENT_CREDENTIALS_ENDPOINT = 'http://169.254.170.23/v1/cr
  */
 const maxValidityOffsetMs = 4.5 * 60 * 1000;
 
+/**
+ * Key used for OSS temporary credential caching in the njs shared dictionary.
+ * @type {string}
+ */
+const INSTANCE_CREDENTIAL_CACHE_KEY = 'instance_credentials';
+
+/**
+ * Name of the njs shared dictionary zone that caches OSS temporary
+ * credentials. Must byte-match the zone declared in
+ * oss/etc/nginx/conf.d/instance_credential_cache.conf.
+ * @type {string}
+ */
+const INSTANCE_CREDENTIAL_CACHE_ZONE = 'instance_credential_cache';
+
+/**
+ * Name of the njs shared dictionary zone used as the single-flight sentinel
+ * for credential refreshes (GH-591). Unlike INSTANCE_CREDENTIAL_CACHE_ZONE
+ * this zone is declared WITH a timeout, so a crashed, hung, or failed
+ * refresher's sentinel entry self-releases. Must byte-match the zone
+ * declared for both flavors in
+ * common/etc/nginx/conf.d/credential_refresh_lock.conf.
+ *
+ * Providers issue credentials valid for at least another 5 minutes while
+ * maxValidityOffsetMs is 4.5 minutes, so a residual sentinel (held at most
+ * for the zone timeout of 30s after a successful refresh) can never gate a
+ * legitimately needed refresh. Revisit the zone timeout if
+ * maxValidityOffsetMs is ever raised toward 5 minutes.
+ * @type {string}
+ */
+const CREDENTIAL_REFRESH_LOCK_ZONE = 'credential_refresh_lock';
+
+/**
+ * The single key inserted into CREDENTIAL_REFRESH_LOCK_ZONE. Whichever
+ * request atomically adds it is elected to walk the credential provider
+ * ladder for the current refresh window.
+ * @type {string}
+ */
+const CREDENTIAL_REFRESH_LOCK_KEY = 'credential_refresh_in_flight';
+
+/**
+ * Value stored under CREDENTIAL_REFRESH_LOCK_KEY. Only the key's presence
+ * matters to the atomic add() election, but the zone's default type is
+ * string, so some string must be written; tests reference this constant
+ * rather than repeating the literal.
+ * @type {string}
+ */
+const CREDENTIAL_REFRESH_LOCK_VALUE = '1';
+
 
 /**
  * Get the current session token from either the instance profile credential
@@ -86,10 +172,81 @@ const maxValidityOffsetMs = 4.5 * 60 * 1000;
  */
 function sessionToken(r) {
     const credentials = readCredentials(r);
+    /* The cache entry can expire between the auth_request credential check
+       and this evaluation (the Plus keyval zone carries a timeout; the OSS
+       shared dict deliberately does not, see
+       oss/etc/nginx/conf.d/instance_credential_cache.conf), so tolerate a
+       missing entry instead of crashing the request with a TypeError. */
+    if (credentials === undefined) {
+        return '';
+    }
     if (credentials.sessionToken) {
         return credentials.sessionToken;
     }
     return '';
+}
+
+/**
+ * Get the long-lived credentials that were configured statically, either in
+ * the AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
+ * environment variables or in the files named by their '_FILE' companions
+ * (GH-67). If no static credentials are configured, then return undefined and
+ * leave the caller to use one of the instance credential providers.
+ *
+ * @returns {Credentials|undefined} statically configured credentials or undefined
+ * @private
+ */
+function _readStaticCredentials() {
+    const accessKeyId = utils.readEnvVarOrFile('AWS_ACCESS_KEY_ID');
+    const secretAccessKey = utils.readEnvVarOrFile('AWS_SECRET_ACCESS_KEY');
+
+    if (!accessKeyId || !secretAccessKey) {
+        return undefined;
+    }
+
+    const sessionToken = utils.readEnvVarOrFile('AWS_SESSION_TOKEN');
+
+    return {
+        accessKeyId: accessKeyId,
+        secretAccessKey: secretAccessKey,
+        sessionToken: sessionToken ? sessionToken : null,
+        expiration: null
+    };
+}
+
+/**
+ * Reports whether the gateway is configured to obtain S3 credentials by
+ * calling STS AssumeRole signed with the statically configured credentials
+ * (GH-122). Active when AWS_ROLE_ARN holds a value, no web identity token
+ * file is configured (web identity keeps precedence - on EKS both variables
+ * are injected together, always with values), and static credentials exist
+ * to sign the STS request with. Without static credentials the role ARN is
+ * ignored and the instance credential providers apply as before.
+ *
+ * Both environment variables are tested by value, not presence: a
+ * set-but-empty variable (e.g. a bare compose pass-through key of an unset
+ * host variable) counts as unset, matching the entrypoint guards in
+ * 00-check-for-required-env.sh - presence semantics here would silently
+ * flip the gateway into a different credential mode than the one those
+ * guards validated and the settings banner reported.
+ *
+ * @param staticCredentials {Credentials|undefined} result of a
+ *        _readStaticCredentials() call the caller already made; omit to have
+ *        the credentials read here
+ * @returns {boolean} true when AssumeRole mode is active
+ * @private
+ */
+function _isAssumeRoleMode(staticCredentials) {
+    if (!process.env['AWS_ROLE_ARN']) {
+        return false;
+    }
+    if (process.env['AWS_WEB_IDENTITY_TOKEN_FILE']) {
+        return false;
+    }
+    if (staticCredentials === undefined) {
+        staticCredentials = _readStaticCredentials();
+    }
+    return staticCredentials !== undefined;
 }
 
 /**
@@ -99,23 +256,19 @@ function sessionToken(r) {
  * @returns {Credentials|undefined} AWS instance profile credentials or undefined
  */
 function readCredentials(r) {
-    if ('AWS_ACCESS_KEY_ID' in process.env && 'AWS_SECRET_ACCESS_KEY' in process.env) {
-        let sessionToken = 'AWS_SESSION_TOKEN' in process.env ?
-            process.env['AWS_SESSION_TOKEN'] : null;
-        if (sessionToken !== null && sessionToken.length === 0) {
-            sessionToken = null;
-        }
-        return {
-            accessKeyId: process.env['AWS_ACCESS_KEY_ID'],
-            secretAccessKey: process.env['AWS_SECRET_ACCESS_KEY'],
-            sessionToken: sessionToken,
-            expiration: null
-        };
+    /* In AssumeRole mode the static credentials only sign the STS call; S3
+       requests must be signed with the assumed temporary credentials from
+       the cache instead (GH-122). The credentials are read once and handed
+       to the mode predicate so this per-request path does not repeat the
+       environment (and, with _FILE variables, file) lookups. */
+    const staticCredentials = _readStaticCredentials();
+    if (staticCredentials !== undefined && !_isAssumeRoleMode(staticCredentials)) {
+        return staticCredentials;
     }
     if ("variables" in r && r.variables.cache_instance_credentials_enabled == 1) {
         return _readCredentialsFromKeyValStore(r);
     } else {
-        return _readCredentialsFromFile();
+        return _readCredentialsFromSharedDict(r);
     }
 }
 
@@ -143,44 +296,26 @@ function _readCredentialsFromKeyValStore(r) {
 }
 
 /**
- * Read the contents of the credentials file into memory. If it is not
- * found, then return undefined.
+ * Read credentials from the OSS njs shared dictionary. If they are not found,
+ * then return undefined.
  *
+ * @param r {NginxHTTPRequest} HTTP request object (used for debug logging)
  * @returns {Credentials|undefined} AWS instance profile credentials or undefined
  * @private
  */
-function _readCredentialsFromFile() {
-    const credsFilePath = _credentialsTempFile();
+function _readCredentialsFromSharedDict(r) {
+    const cached = _instanceCredentialSharedDict().get(INSTANCE_CREDENTIAL_CACHE_KEY);
+
+    if (!cached) {
+        return undefined;
+    }
 
     try {
-        const creds = fs.readFileSync(credsFilePath);
-        return JSON.parse(creds);
+        return JSON.parse(cached);
     } catch (e) {
-        /* Do not throw an exception in the case of when the
-           credentials file path is invalid in order to signal to
-           the caller that such a file has not been created yet. */
-        if (e.code === 'ENOENT') {
-            return undefined;
-        }
-        throw e;
+        utils.debug_log(r, `Error parsing JSON value from ngx.shared.${INSTANCE_CREDENTIAL_CACHE_ZONE}: ${e}`);
+        return undefined;
     }
-}
-
-/**
- * Returns the path to the credentials temporary cache file.
- *
- * @returns {string} path on the file system to credentials cache file
- * @private
- */
-function _credentialsTempFile() {
-    if (process.env['AWS_CREDENTIALS_TEMP_FILE']) {
-        return process.env['AWS_CREDENTIALS_TEMP_FILE'];
-    }
-    if (process.env['TMPDIR']) {
-        return `${process.env['TMPDIR']}/credentials.json`
-    }
-
-    return '/tmp/credentials.json';
 }
 
 /**
@@ -191,19 +326,25 @@ function _credentialsTempFile() {
  */
 function writeCredentials(r, credentials) {
     /* Do not bother writing credentials if we are running in a mode where we
-       do not need instance credentials. */
-    if (process.env['AWS_ACCESS_KEY_ID'] && process.env['AWS_SECRET_ACCESS_KEY']) {
+       do not need instance credentials. In AssumeRole mode the assumed
+       temporary credentials must be cached even though static credentials
+       are configured (GH-122). */
+    const staticCredentials = _readStaticCredentials();
+    if (staticCredentials !== undefined && !_isAssumeRoleMode(staticCredentials)) {
         return;
     }
 
-    if (!credentials) {
-        throw `Cannot write invalid credentials: ${JSON.stringify(credentials)}`;
+    /* Guard against caching malformed credentials (such as an error response
+       body that was mistakenly parsed as credentials) - field values are
+       deliberately not logged so that secrets cannot leak into logs. */
+    if (!credentials || !credentials.accessKeyId || !credentials.secretAccessKey) {
+        throw 'Cannot write invalid credentials: missing accessKeyId or secretAccessKey';
     }
 
     if ("variables" in r && r.variables.cache_instance_credentials_enabled == 1) {
         _writeCredentialsToKeyValStore(r, credentials);
     } else {
-        _writeCredentialsToFile(credentials);
+        _writeCredentialsToSharedDict(credentials);
     }
 }
 
@@ -219,15 +360,121 @@ function _writeCredentialsToKeyValStore(r, credentials) {
 }
 
 /**
- * Write the instance profile credentials to a file on the file system. This
- * file will be quite small and should end up in the file cache relatively
- * quickly if it is repeatedly read.
+ * Write the instance profile credentials to the OSS njs shared dictionary.
  *
  * @param credentials {Credentials} AWS instance profile credentials
  * @private
  */
-function _writeCredentialsToFile(credentials) {
-    fs.writeFileSync(_credentialsTempFile(), JSON.stringify(credentials));
+function _writeCredentialsToSharedDict(credentials) {
+    _instanceCredentialSharedDict().set(INSTANCE_CREDENTIAL_CACHE_KEY, JSON.stringify(credentials));
+}
+
+/**
+ * Look up an njs shared dictionary zone, returning undefined when the njs
+ * environment or the zone is absent (e.g. the njs CLI, or a custom NGINX
+ * configuration missing the declaration). Callers choose their own failure
+ * mode: _instanceCredentialSharedDict throws (the credential cache is
+ * required), _tryAcquireCredentialRefreshLock fails open (the sentinel is
+ * an optimization).
+ *
+ * @param zoneName {string} name of the js_shared_dict_zone to look up
+ * @returns {NgxSharedDict|undefined} the shared dictionary, or undefined when unavailable
+ * @private
+ */
+function _sharedDictOrUndefined(zoneName) {
+    if (typeof ngx === 'undefined' || !("shared" in ngx) ||
+        !(zoneName in ngx.shared)) {
+        return undefined;
+    }
+
+    return ngx.shared[zoneName];
+}
+
+/**
+ * Get the OSS shared dictionary used to cache temporary credentials.
+ *
+ * The OSS image configures this zone with js_shared_dict_zone. Keeping the
+ * lookup behind a helper produces a clear failure when a custom NGINX config
+ * omits that required zone instead of silently falling back to disk.
+ *
+ * @returns {NgxSharedDict} shared dictionary used for credential caching
+ * @private
+ */
+function _instanceCredentialSharedDict() {
+    const dict = _sharedDictOrUndefined(INSTANCE_CREDENTIAL_CACHE_ZONE);
+    if (dict === undefined) {
+        throw `NGINX shared dictionary ${INSTANCE_CREDENTIAL_CACHE_ZONE} is unavailable`;
+    }
+
+    return dict;
+}
+
+/**
+ * Try to acquire the single-flight sentinel that elects one request to
+ * refresh credentials inside the refresh margin while every other request
+ * keeps serving the still-valid cached credentials (GH-591).
+ *
+ * The sentinel is an atomic shared-dictionary add(): it succeeds for exactly
+ * one request per zone-timeout window across all workers. The entry is
+ * deliberately never deleted - after a successful refresh the fresh
+ * expiration keeps requests on the fast path anyway, and after a failed
+ * refresh the zone timeout re-arms the next attempt at most once per window
+ * while the cached credentials remain valid.
+ *
+ * Unlike _instanceCredentialSharedDict this fails OPEN (returns true) when
+ * the zone is missing or add() throws: the sentinel is an optimization, and
+ * failing closed would mean no request ever refreshes, turning a merely
+ * missing zone into an outage at credential expiry. Failing open degrades to
+ * the pre-GH-591 behavior of every request refreshing.
+ *
+ * @param r {NginxHTTPRequest} HTTP request object (used for debug logging)
+ * @returns {boolean} true when this request must perform the refresh
+ * @private
+ */
+function _tryAcquireCredentialRefreshLock(r) {
+    const lockDict = _sharedDictOrUndefined(CREDENTIAL_REFRESH_LOCK_ZONE);
+    if (lockDict === undefined) {
+        utils.debug_log(r, `NGINX shared dictionary ${CREDENTIAL_REFRESH_LOCK_ZONE} is unavailable, refreshing without single-flight coordination`);
+        return true;
+    }
+    try {
+        /* No per-item timeout is passed: the zone-level timeout governs, and
+           a per-item timeout would throw a TypeError on any zone declared
+           without one (a hazard for custom configurations). The value must
+           be a string - the zone's default type is string, and a number
+           would throw a TypeError too. */
+        return lockDict.add(CREDENTIAL_REFRESH_LOCK_KEY, CREDENTIAL_REFRESH_LOCK_VALUE);
+    } catch (e) {
+        /* SharedMemoryError (zone full) or any other failure: refresh
+           anyway - the worst case is the pre-GH-591 herd. */
+        utils.debug_log(r, `Could not acquire the credential refresh lock, refreshing anyway: ${e}`);
+        return true;
+    }
+}
+
+/**
+ * Answer a failed credential fetch: when the cached credentials are still
+ * valid at failure time (this request was elected refresher inside the
+ * refresh margin) the request is served from the cache with a 200 - the
+ * failure has already been logged by the caller and the sentinel zone
+ * timeout re-arms the next refresh attempt - otherwise the failure surfaces
+ * as a 500 exactly as on a cold start (GH-591). The deadline is re-checked
+ * against a live clock here because a slow provider fetch (e.g. the IMDSv1
+ * token-timeout fallback) can outlast the remaining validity when the
+ * refresh started late in the margin, and serving credentials that expired
+ * during the fetch would turn the 500 into an S3 signature failure.
+ *
+ * @param r {NginxHTTPRequest} HTTP request object
+ * @param cachedValidUntilMs {number} epoch ms until which the cached credentials stay valid; 0 when none
+ * @private
+ */
+function _returnCredentialFetchFailure(r, cachedValidUntilMs) {
+    if (new Date().getTime() < cachedValidUntilMs) {
+        utils.debug_log(r, 'Credential refresh failed; serving still-valid cached credentials');
+        r.return(200);
+        return;
+    }
+    r.return(500);
 }
 
 /**
@@ -249,8 +496,13 @@ function _writeCredentialsToFile(credentials) {
  */
 async function fetchCredentials(r) {
     /* If we are not using an AWS instance profile to set our credentials we
-       exit quickly and don't write a credentials file. */
-    if (utils.areAllEnvVarsSet(['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'])) {
+       exit quickly and don't write a credentials file. In AssumeRole mode
+       the static credentials are only the input to the STS call, so the
+       fetch-and-cache flow below still applies (GH-122). Both values are
+       computed once here and reused by the provider ladder below. */
+    const staticCredentials = _readStaticCredentials();
+    const assumeRoleMode = _isAssumeRoleMode(staticCredentials);
+    if (staticCredentials !== undefined && !assumeRoleMode) {
         r.return(200);
         return;
     }
@@ -260,34 +512,91 @@ async function fetchCredentials(r) {
     try {
         current = readCredentials(r);
     } catch (e) {
-        utils.debug_log(r, `Could not read credentials: ${e}`);
+        /* A failing credential cache turns every request into a 500, so
+           surface it at error level rather than only under DEBUG (a custom
+           NGINX configuration missing the cache zone lands here). */
+        r.error(`Could not read credentials: ${e}`);
         r.return(500);
         return;
     }
 
+    /* Millisecond deadline until which the cached credentials stay valid
+       while the provider ladder below runs (0 when nothing valid is
+       cached), so a failed refresh can be answered from the cache instead
+       of surfacing a 500 for an outage the refresh margin exists to absorb
+       (GH-591). A deadline rather than a boolean: the provider fetch can
+       outlast the remaining validity, so usability must be re-checked at
+       failure time. */
+    let cachedValidUntilMs = 0;
+
     if (current) {
         // If AWS returns a Unix timestamp it will be in seconds, but in Date constructor we should provide timestamp in milliseconds
         // In some situations (including EC2 and Fargate) current.expiration will be an RFC 3339 string - see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html#instance-metadata-security-credentials
-        const expireAt = typeof current.expiration == 'number' ? current.expiration * 1000 : current.expiration
-        const exp = new Date(expireAt).getTime() - maxValidityOffsetMs;
-        if (NOW.getTime() < exp) {
+        const expireAtValue = typeof current.expiration == 'number' ?
+            current.expiration * 1000 : current.expiration;
+        const expireAtMs = new Date(expireAtValue).getTime();
+        const refreshAtMs = expireAtMs - maxValidityOffsetMs;
+        /* Use a live clock rather than NOW: NOW is stable per njs VM context
+           for signature consistency, so it goes stale for expiry checks
+           whenever module scope outlives a single request. */
+        const nowMs = new Date().getTime();
+        if (nowMs < refreshAtMs) {
             r.return(200);
             return;
+        }
+        /* Inside the refresh margin the cached credentials are still valid,
+           so exactly one request needs to walk the provider ladder: the
+           atomic sentinel elects it and every other request answers from
+           the cache (GH-591). Unparseable expirations (both comparisons
+           against NaN are false) and truly expired credentials skip the
+           election and refresh unconditionally, exactly like a cold start -
+           nothing valid is left to serve. */
+        if (nowMs < expireAtMs) {
+            if (!_tryAcquireCredentialRefreshLock(r)) {
+                r.return(200);
+                return;
+            }
+            cachedValidUntilMs = expireAtMs;
         }
     }
 
     let credentials;
 
-    utils.debug_log(r, 'Cached credentials are expired or not present, requesting new ones');
+    /* Both branches keep the 'requesting new ones' marker that the smoke
+       tests grep for (see .claude/skills/smoke-test/references/regressions.md). */
+    utils.debug_log(r, cachedValidUntilMs !== 0 ?
+        'Cached credentials are within the refresh margin, requesting new ones' :
+        'Cached credentials are expired or not present, requesting new ones');
 
-    if (utils.areAllEnvVarsSet('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI')) {
+    /* AssumeRole leads the ladder: it is the only provider reachable while
+       static credentials are configured (matching the AWS SDKs, where
+       environment credentials win), and _isAssumeRoleMode already yields to
+       web identity when both are configured. */
+    if (assumeRoleMode) {
+        try {
+            credentials = await _fetchAssumeRoleCredentials(r, staticCredentials);
+        } catch (e) {
+            /* A failing STS call turns every request into a 500 once no
+               valid cached credentials remain (GH-591), so surface it at
+               error level rather than only under DEBUG - the same contract
+               as the cache read/write failures above and below. */
+            r.error(`Could not assume role using static credentials: ${e}`);
+            _returnCredentialFetchFailure(r, cachedValidUntilMs);
+            return;
+        }
+    }
+    else if (utils.areAllEnvVarsSet('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI')) {
         const relative_uri = process.env['AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'] || '';
         const uri = ECS_CREDENTIAL_BASE_URI + relative_uri;
         try {
             credentials = await _fetchEcsRoleCredentials(uri);
         } catch (e) {
-            utils.debug_log(r, 'Could not load ECS task role credentials: ' + JSON.stringify(e));
-            r.return(500);
+            /* Same error-level contract as the AssumeRole and cache
+               read/write failures: this either 500s the request or absorbs
+               a refresh failure the operator must be able to see without
+               DEBUG (GH-591). */
+            r.error(`Could not load ECS task role credentials: ${e}`);
+            _returnCredentialFetchFailure(r, cachedValidUntilMs);
             return;
         }
     }
@@ -295,8 +604,8 @@ async function fetchCredentials(r) {
         try {
             credentials = await _fetchWebIdentityCredentials(r)
         } catch (e) {
-            utils.debug_log(r, 'Could not assume role using web identity: ' + JSON.stringify(e));
-            r.return(500);
+            r.error(`Could not assume role using web identity: ${e}`);
+            _returnCredentialFetchFailure(r, cachedValidUntilMs);
             return;
         }
     } 
@@ -304,27 +613,44 @@ async function fetchCredentials(r) {
         try {
             credentials = await _fetchEKSPodIdentityCredentials(r)
         } catch (e) {
-            utils.debug_log(r, 'Could not assume role using EKS pod identity: ' + JSON.stringify(e));
-            r.return(500);
+            r.error(`Could not assume role using EKS pod identity: ${e}`);
+            _returnCredentialFetchFailure(r, cachedValidUntilMs);
             return;
         }
     } else {
         try {
-            credentials = await _fetchEC2RoleCredentials();
+            credentials = await _fetchEC2RoleCredentials(r);
         } catch (e) {
-            utils.debug_log(r, 'Could not load EC2 task role credentials: ' + JSON.stringify(e));
-            r.return(500);
+            r.error(`Could not load EC2 task role credentials: ${e}`);
+            _returnCredentialFetchFailure(r, cachedValidUntilMs);
             return;
         }
     }
     try {
         writeCredentials(r, credentials);
     } catch (e) {
-        utils.debug_log(r, `Could not write credentials: ${e}`);
-        r.return(500);
+        /* Cache write failures also 500 every request once no valid cached
+           credentials remain (GH-591), so they too must be visible at the
+           default error log level, not only under DEBUG. */
+        r.error(`Could not write credentials: ${e}`);
+        _returnCredentialFetchFailure(r, cachedValidUntilMs);
         return;
     }
     r.return(200);
+}
+
+/**
+ * Throws when a credentials-endpoint response has a non-2xx status so that
+ * error response bodies are never parsed as credentials.
+ *
+ * @param resp {Response} response object returned by ngx.fetch
+ * @param endpointName {string} human-readable endpoint name for the error
+ * @private
+ */
+function _checkResponseOk(resp, endpointName) {
+    if (!resp.ok) {
+        throw `${endpointName} response was not ok (status: ${resp.status}).`;
+    }
 }
 
 /**
@@ -337,9 +663,7 @@ async function fetchCredentials(r) {
  */
 async function _fetchEcsRoleCredentials(credentialsUri) {
     const resp = await ngx.fetch(credentialsUri);
-    if (!resp.ok) {
-        throw 'Credentials endpoint response was not ok.';
-    }
+    _checkResponseOk(resp, 'ECS credentials endpoint');
     const creds = await resp.json();
 
     return {
@@ -354,22 +678,72 @@ async function _fetchEcsRoleCredentials(credentialsUri) {
  * Get the credentials needed to generate AWS signatures from the EC2
  * metadata endpoint.
  *
+ * @param r {NginxHTTPRequest} HTTP request object
  * @returns {Promise<Credentials>}
  * @private
  */
-async function _fetchEC2RoleCredentials() {
-    const tokenResp = await ngx.fetch(EC2_IMDS_TOKEN_ENDPOINT, {
-        headers: {
-            'x-aws-ec2-metadata-token-ttl-seconds': '21600',
-        },
-        method: 'PUT',
-    });
-    const token = await tokenResp.text();
+async function _fetchEC2RoleCredentials(r) {
+    /* Standard AWS SDK setting: when true, never fall back to IMDSv1 -
+       credential retrieval fails closed when an IMDSv2 token cannot be
+       obtained.
+       See: https://docs.aws.amazon.com/sdkref/latest/guide/feature-imds-credentials.html */
+    const imdsV1Disabled = utils.parseBoolean(
+        process.env['AWS_EC2_METADATA_V1_DISABLED'] || 'false');
+    let tokenResp = null;
+    let imdsV1FallbackReason = null;
+    try {
+        tokenResp = await ngx.fetch(EC2_IMDS_TOKEN_ENDPOINT, {
+            headers: {
+                'x-aws-ec2-metadata-token-ttl-seconds': '21600',
+            },
+            method: 'PUT',
+        });
+    } catch (e) {
+        /* A network error or timeout on the token request falls back to
+           IMDSv1 below, matching AWS SDK behavior. This covers instances
+           whose HttpPutResponseHopLimit is too low for the gateway's network
+           position (e.g. running inside a container behind a bridge network),
+           where the token response is dropped but IMDSv1 GETs succeed. */
+        if (imdsV1Disabled) {
+            throw `IMDSv2 token request failed (${e}) and IMDSv1 fallback ` +
+                'is disabled by AWS_EC2_METADATA_V1_DISABLED.';
+        }
+        imdsV1FallbackReason = `the IMDSv2 token request failed (${e})`;
+        utils.debug_log(r, `EC2 IMDS token request failed (${e}), falling back to IMDSv1`);
+    }
+    /* Fall back to IMDSv1 (no session token) when the IMDSv2 token request is
+       rejected with 403/404/405, matching AWS SDK behavior with IMDSv1-only
+       metadata services such as older metadata emulators. Other failure
+       statuses (e.g. 429/5xx throttling on an IMDSv2-required instance) are
+       fatal so that the root cause is surfaced instead of the misleading 401
+       a token-less request would produce. */
+    const headers = {};
+    if (tokenResp) {
+        if (tokenResp.ok) {
+            headers['x-aws-ec2-metadata-token'] = await tokenResp.text();
+        } else if (imdsV1Disabled) {
+            throw `IMDS token endpoint response was not ok (status: ${tokenResp.status}) ` +
+                'and IMDSv1 fallback is disabled by AWS_EC2_METADATA_V1_DISABLED.';
+        } else if (tokenResp.status === 403 || tokenResp.status === 404 ||
+                   tokenResp.status === 405) {
+            imdsV1FallbackReason = `the IMDS token endpoint returned status ${tokenResp.status}`;
+            utils.debug_log(r, `EC2 IMDS token endpoint returned status ${tokenResp.status}, falling back to IMDSv1`);
+        } else {
+            _checkResponseOk(tokenResp, 'IMDS token endpoint');
+        }
+    }
     let resp = await ngx.fetch(EC2_IMDS_SECURITY_CREDENTIALS_ENDPOINT, {
-        headers: {
-            'x-aws-ec2-metadata-token': token,
-        },
+        headers: headers,
     });
+    if (!resp.ok && imdsV1FallbackReason) {
+        /* Without this attribution, an IMDSv2-required instance surfaces only
+           the 401 from the token-less GET, hiding the token failure that
+           caused the downgrade. */
+        throw `Security credentials endpoint response was not ok (status: ${resp.status}) ` +
+            `after falling back to IMDSv1 because ${imdsV1FallbackReason}; ` +
+            'the instance may require IMDSv2.';
+    }
+    _checkResponseOk(resp, 'Security credentials endpoint');
     /* This _might_ get multiple possible roles in other scenarios, however,
        EC2 supports attaching one role only.It should therefore be safe to take
        the whole output, even given IMDS _might_ (?) be able to return multiple
@@ -379,10 +753,9 @@ async function _fetchEC2RoleCredentials() {
         throw 'No credentials available for EC2 instance';
     }
     resp = await ngx.fetch(EC2_IMDS_SECURITY_CREDENTIALS_ENDPOINT + credName, {
-        headers: {
-            'x-aws-ec2-metadata-token': token,
-        },
+        headers: headers,
     });
+    _checkResponseOk(resp, 'EC2 role credentials endpoint');
     const creds = await resp.json();
 
     return {
@@ -401,12 +774,16 @@ async function _fetchEC2RoleCredentials() {
  * @private
  */
 async function _fetchEKSPodIdentityCredentials() {
-    const token = fs.readFileSync(process.env['AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE']);
+    /* Trim the token so a trailing newline in a hand-created token file does
+       not produce an invalid Authorization header value; tokens themselves
+       never contain whitespace. */
+    const token = fs.readFileSync(process.env['AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE']).toString().trim();
     let resp = await ngx.fetch(EKS_POD_IDENTITY_AGENT_CREDENTIALS_ENDPOINT, {
         headers: {
             'Authorization': token,
         },
     });
+    _checkResponseOk(resp, 'EKS Pod Identity credentials endpoint');
     const creds = await resp.json();
 
     return {
@@ -417,6 +794,231 @@ async function _fetchEKSPodIdentityCredentials() {
     };
 }
 /**
+ * Resolve the STS endpoint URL and the region used in the SigV4 credential
+ * scope for signed requests to it: an explicit STS_ENDPOINT wins (signed
+ * with AWS_REGION when set, else S3_REGION, else us-east-1); otherwise
+ * AWS_STS_REGIONAL_ENDPOINTS='regional' derives the endpoint from AWS_REGION
+ * (required in that mode); otherwise the global endpoint, whose credential
+ * scope AWS requires to be us-east-1.
+ *
+ * S3_REGION participates in the custom-endpoint fallback because a custom
+ * STS endpoint is usually a private (VPC) endpoint in the same region as the
+ * bucket, and AWS rejects a signature whose scope region does not match the
+ * endpoint's. S3-compatible stores generally do not enforce the scope
+ * region, so any fallback works for them. AWS_REGION remains the explicit
+ * override when the STS endpoint's region differs from the bucket's.
+ *
+ * On EKS, the ServiceAccount can be annotated with
+ * 'eks.amazonaws.com/sts-regional-endpoints' to control the usage of
+ * regional endpoints. We are using the same standard environment variable
+ * here as the AWS SDK. This is with the exception of replacing the value
+ * `legacy` with `global` to match what EKS sets the variable to.
+ *
+ * @see {@link https://docs.aws.amazon.com/sdkref/latest/guide/feature-sts-regionalized-endpoints.html | STS regionalized endpoints}
+ * @see {@link https://docs.aws.amazon.com/eks/latest/userguide/configure-sts-endpoint.html | Configure the STS endpoint on EKS}
+ * @see {@link https://docs.aws.amazon.com/general/latest/gr/sts.html | AWS STS endpoints}
+ * @returns {{endpoint: string, region: string}} STS endpoint URL and signing region
+ * @private
+ */
+function _getStsEndpoint() {
+    const configuredRegion = process.env['AWS_REGION'];
+    const endpoint = process.env['STS_ENDPOINT'];
+    if (endpoint) {
+        return {
+            endpoint: endpoint,
+            region: configuredRegion ? configuredRegion :
+                (process.env['S3_REGION'] || STS_DEFAULT_SIGNING_REGION)
+        };
+    }
+    const stsRegional = process.env['AWS_STS_REGIONAL_ENDPOINTS'] || 'global';
+    if (stsRegional === 'regional') {
+        /* STS regional endpoints can be derived from the region's name. */
+        if (!configuredRegion) {
+            throw 'Missing required AWS_REGION env variable';
+        }
+        return {
+            endpoint: `https://sts.${configuredRegion}.amazonaws.com`,
+            region: configuredRegion
+        };
+    }
+    return {
+        endpoint: STS_GLOBAL_ENDPOINT,
+        region: STS_DEFAULT_SIGNING_REGION
+    };
+}
+
+/**
+ * Split an HTTP(S) endpoint URL into the host (hostname[:port], exactly as
+ * it must appear in the signed Host header) and the URI-encoded absolute
+ * path used in the canonical request ('/' when the URL has no path).
+ *
+ * @param endpoint {string} endpoint URL, e.g. https://sts.amazonaws.com
+ * @returns {{host: string, path: string}} host and path components
+ * @private
+ */
+function _parseStsEndpointUrl(endpoint) {
+    const schemeSeparator = '://';
+    const schemeEnd = endpoint.indexOf(schemeSeparator);
+    const scheme = schemeEnd < 0 ? '' : endpoint.slice(0, schemeEnd).toLowerCase();
+    if (scheme !== 'http' && scheme !== 'https') {
+        throw `STS endpoint is not an absolute http(s) URL (${endpoint})`;
+    }
+    /* A query string or fragment cannot be represented in the canonical
+       request this parser feeds (the query would be signed as part of the
+       path, or worse, of the Host header when the URL has no path), so the
+       signature would never verify. Reject the endpoint with a clear
+       message instead of failing every AssumeRole call with an opaque
+       SignatureDoesNotMatch. */
+    if (endpoint.indexOf('?') >= 0 || endpoint.indexOf('#') >= 0) {
+        throw `STS endpoint must not contain a query string or fragment (${endpoint})`;
+    }
+    const hostAndPath = endpoint.slice(schemeEnd + schemeSeparator.length);
+    const pathStart = hostAndPath.indexOf('/');
+    /* Both empty-host shapes must be rejected: 'https:///path' (pathStart
+       of 0) and the bare 'https://' (empty remainder, e.g. a template
+       interpolating an unset host variable). Otherwise the empty host is
+       signed into the canonical request and every AssumeRole call fails
+       with an opaque per-request fetch error instead of this clear
+       configuration error. */
+    if (pathStart === 0 || hostAndPath.length === 0) {
+        throw `STS endpoint has an empty host (${endpoint})`;
+    }
+    if (pathStart < 0) {
+        return { host: hostAndPath, path: '/' };
+    }
+    return {
+        host: hostAndPath.slice(0, pathStart),
+        path: hostAndPath.slice(pathStart)
+    };
+}
+
+/**
+ * Extract temporary credentials from an XML AssumeRoleResponse document.
+ * XML is parsed rather than JSON because XML is what STS returns by default
+ * and the only format S3-compatible stores implement.
+ *
+ * @see {@link https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html | AssumeRole}
+ * @param responseBody {string} XML response body from the STS endpoint
+ * @returns {Credentials} temporary credentials of the assumed role session
+ * @private
+ */
+function _parseAssumeRoleResponse(responseBody) {
+    let doc;
+    try {
+        doc = mod_xml.parse(responseBody);
+    } catch (e) {
+        throw `Unable to parse STS AssumeRole response as XML: ${e}`;
+    }
+
+    const response = doc.AssumeRoleResponse;
+    const result = response ? response.AssumeRoleResult : undefined;
+    const credentials = result ? result.Credentials : undefined;
+    /* Validate the element text, not the elements: an empty element
+       (<SessionToken/>) is a truthy XMLNode whose $text is '', and an empty
+       credential field would be cached and then fail every S3 request as an
+       opaque 403 (or, for Expiration, parse as NaN and defeat the refresh
+       check entirely). */
+    const accessKeyId = credentials && credentials.AccessKeyId ?
+        credentials.AccessKeyId.$text : undefined;
+    const secretAccessKey = credentials && credentials.SecretAccessKey ?
+        credentials.SecretAccessKey.$text : undefined;
+    const sessionToken = credentials && credentials.SessionToken ?
+        credentials.SessionToken.$text : undefined;
+    const expiration = credentials && credentials.Expiration ?
+        credentials.Expiration.$text : undefined;
+    if (!accessKeyId || !secretAccessKey || !sessionToken || !expiration) {
+        /* The body is deliberately not included in the message: a
+           wrong-but-2xx response could still contain credential material. */
+        throw 'STS AssumeRole response is missing the ' +
+            'AssumeRoleResponse/AssumeRoleResult/Credentials elements';
+    }
+
+    return {
+        accessKeyId: accessKeyId,
+        secretAccessKey: secretAccessKey,
+        sessionToken: sessionToken,
+        expiration: expiration,
+    };
+}
+
+/**
+ * Get temporary credentials by calling AssumeRole on the STS endpoint,
+ * authenticating with the statically configured credentials (GH-122).
+ * Unlike AssumeRoleWithWebIdentity this call must be SigV4-signed, and it is
+ * sent the way the AWS SDKs send it - a form-encoded POST - because
+ * S3-compatible stores only implement that form.
+ *
+ * @see {@link https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html | AssumeRole}
+ * @param r {NginxHTTPRequest} HTTP request object (used only for debug logging)
+ * @param sourceCredentials {Credentials} statically configured credentials
+ *        that sign the AssumeRole call (already read by fetchCredentials)
+ * @returns {Promise<Credentials>}
+ * @private
+ */
+async function _fetchAssumeRoleCredentials(r, sourceCredentials) {
+    const arn = process.env['AWS_ROLE_ARN'];
+    const sessionName = process.env['AWS_ROLE_SESSION_NAME'] || DEFAULT_ROLE_SESSION_NAME;
+    const sts = _getStsEndpoint();
+    const url = _parseStsEndpointUrl(sts.endpoint);
+
+    /* Percent-encode the values - role ARNs contain ':' and '/', and IAM
+       role session names may legally contain '+' and '='. The parameters
+       must stay sorted by name: the signature covers the exact body bytes. */
+    const body = 'Action=AssumeRole' +
+        `&RoleArn=${encodeURIComponent(arn)}` +
+        `&RoleSessionName=${encodeURIComponent(sessionName)}` +
+        `&Version=${STS_API_VERSION}`;
+
+    /* A fresh timestamp rather than utils.Now(): that constant is frozen per
+       njs VM context for S3 signature stability, and a stale timestamp here
+       would drift outside the SigV4 clock-skew window and be rejected. */
+    const signed = awssig4.signRequestV4(r, new Date(), sts.region, 'sts',
+        'POST', url.path, '', url.host, body, sourceCredentials);
+
+    const headers = {
+        'Authorization': signed.authHeader,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Amz-Content-Sha256': signed.payloadHash,
+        'X-Amz-Date': signed.amzDatetime
+    };
+    /* Statically configured temporary source credentials (role chaining)
+       carry a session token, which is a signed header and must be sent. */
+    if (sourceCredentials.sessionToken) {
+        headers['X-Amz-Security-Token'] = sourceCredentials.sessionToken;
+    }
+
+    utils.debug_log(r, `Fetching credentials via STS AssumeRole from ${sts.endpoint}`);
+
+    const response = await ngx.fetch(sts.endpoint, {
+        body: body,
+        headers: headers,
+        method: 'POST',
+    });
+    if (!response.ok) {
+        throw await _stsErrorFromResponse('STS AssumeRole', response);
+    }
+
+    return _parseAssumeRoleResponse(await response.text());
+}
+
+/**
+ * Build the error message thrown for a non-2xx STS response, capping the
+ * amount of the error body kept so that an unexpectedly large error document
+ * cannot balloon the thrown message; real STS error bodies are far smaller
+ * than STS_ERROR_BODY_MAX_LENGTH. Shared by both STS fetchers so the cap and
+ * the message shape cannot drift apart.
+ *
+ * @param label {string} human-readable name of the call that failed
+ * @param response {Response} non-2xx response object returned by ngx.fetch
+ * @returns {Promise<string>} error message ready to be thrown
+ * @private
+ */
+async function _stsErrorFromResponse(label, response) {
+    const errorBody = (await response.text()).slice(0, STS_ERROR_BODY_MAX_LENGTH);
+    return `${label} response was not ok (status: ${response.status}, body: ${errorBody}).`;
+}
+
+/**
  * Get the credentials by assuming calling AssumeRoleWithWebIdentity with the environment variable
  * values ROLE_ARN, AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_SESSION_NAME
  *
@@ -425,37 +1027,19 @@ async function _fetchEKSPodIdentityCredentials() {
  */
 async function _fetchWebIdentityCredentials(r) {
     const arn = process.env['AWS_ROLE_ARN'];
-    const name = process.env['AWS_ROLE_SESSION_NAME'];
+    const name = process.env['AWS_ROLE_SESSION_NAME'] || DEFAULT_ROLE_SESSION_NAME;
+    const sts_endpoint = _getStsEndpoint().endpoint;
 
-    let sts_endpoint = process.env['STS_ENDPOINT'];
-    if (!sts_endpoint) {
-        /* On EKS, the ServiceAccount can be annotated with
-           'eks.amazonaws.com/sts-regional-endpoints' to control
-           the usage of regional endpoints. We are using the same standard
-           environment variable here as the AWS SDK. This is with the exception
-           of replacing the value `legacy` with `global` to match what EKS sets
-           the variable to.
-           See: https://docs.aws.amazon.com/sdkref/latest/guide/feature-sts-regionalized-endpoints.html
-           See: https://docs.aws.amazon.com/eks/latest/userguide/configure-sts-endpoint.html */
-        const sts_regional = process.env['AWS_STS_REGIONAL_ENDPOINTS'] || 'global';
-        if (sts_regional === 'regional') {
-            /* STS regional endpoints can be derived from the region's name.
-               See: https://docs.aws.amazon.com/general/latest/gr/sts.html */
-            const region = process.env['AWS_REGION'];
-            if (region) {
-                sts_endpoint = `https://sts.${region}.amazonaws.com`;
-            } else {
-                throw 'Missing required AWS_REGION env variable';
-            }
-        } else {
-            // This is the default global endpoint
-            sts_endpoint = 'https://sts.amazonaws.com';
-        }
-    }
+    /* Trim the token so a trailing newline in a hand-created token file is
+       not percent-encoded into the token value (STS would reject it); JWTs
+       and OAuth tokens never contain leading or trailing whitespace. */
+    const token = fs.readFileSync(process.env['AWS_WEB_IDENTITY_TOKEN_FILE']).toString().trim();
 
-    const token = fs.readFileSync(process.env['AWS_WEB_IDENTITY_TOKEN_FILE']);
-
-    const params = `Version=2011-06-15&Action=AssumeRoleWithWebIdentity&RoleArn=${arn}&RoleSessionName=${name}&WebIdentityToken=${token}`;
+    /* Percent-encode the values - IAM role session names may legally contain
+       '+' and '=', and web identity tokens that are not base64url-encoded
+       JWTs (e.g. OAuth access tokens) may contain characters that corrupt
+       query-string parsing when left unencoded. */
+    const params = `Version=${STS_API_VERSION}&Action=AssumeRoleWithWebIdentity&RoleArn=${encodeURIComponent(arn)}&RoleSessionName=${encodeURIComponent(name)}&WebIdentityToken=${encodeURIComponent(token)}`;
 
     const response = await ngx.fetch(sts_endpoint + "?" + params, {
         headers: {
@@ -463,6 +1047,9 @@ async function _fetchWebIdentityCredentials(r) {
         },
         method: 'GET',
     });
+    if (!response.ok) {
+        throw await _stsErrorFromResponse('STS endpoint', response);
+    }
 
     const resp = await response.json();
     const creds = resp.AssumeRoleWithWebIdentityResponse.AssumeRoleWithWebIdentityResult.Credentials;
@@ -476,19 +1063,36 @@ async function _fetchWebIdentityCredentials(r) {
 }
 
 /**
- * Get the current timestamp. This timestamp will be used across functions in
- * order for there to be no variations in signatures.
+ * Get the timestamp used across functions in order for there to be no
+ * variations in signatures.
  *
- * @returns {Date} The current moment as a timestamp
+ * Delegates to utils.Now() - the constant moved there so that awssig4.js can
+ * read it without importing this module (njs cannot resolve circular
+ * imports). The export stays because removing an exported key is a breaking
+ * change for custom configurations.
+ *
+ * @returns {Date} signature-stable timestamp for the current VM context
  */
 function Now() {
-    return NOW;
+    return utils.Now();
 }
 
 export default {
+    CREDENTIAL_REFRESH_LOCK_KEY,
+    CREDENTIAL_REFRESH_LOCK_VALUE,
+    INSTANCE_CREDENTIAL_CACHE_KEY,
     Now,
     fetchCredentials,
     readCredentials,
     sessionToken,
-    writeCredentials
+    writeCredentials,
+    // These functions do not need to be exposed, but they are exposed so that
+    // unit tests can run against them.
+    _isAssumeRoleMode,
+    _getStsEndpoint,
+    _parseAssumeRoleResponse,
+    _parseStsEndpointUrl,
+    _readStaticCredentials,
+    _returnCredentialFetchFailure,
+    _tryAcquireCredentialRefreshLock
 }

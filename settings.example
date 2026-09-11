@@ -2,11 +2,26 @@ ALLOW_DYNAMIC_BUCKET_NAME=false
 HEADER_DYNAMIC_BUCKET_NAME=X-Bucket-Name
 S3_BUCKET_NAME=my-bucket
 AWS_ACCESS_KEY_ID=ZZZZZZZZZZZZZZZZZZZZ
-AWS_SECRET_ACCESS_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+AWS_SECRET_ACCESS_KEY=<YOUR_AWS_SECRET_ACCESS_KEY>
 AWS_SESSION_TOKEN=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+# Credentials may instead be supplied through files, e.g. container secrets.
+# A credential and its _FILE companion are mutually exclusive.
+#AWS_ACCESS_KEY_ID_FILE=/run/secrets/aws_access_key_id
+#AWS_SECRET_ACCESS_KEY_FILE=/run/secrets/aws_secret_access_key
+#AWS_SESSION_TOKEN_FILE=/run/secrets/aws_session_token
+# Optionally assume an IAM role with the static credentials above and sign S3
+# requests with the returned temporary credentials (requires
+# AWS_SIGS_VERSION=4).
+#AWS_ROLE_ARN=arn:aws:iam::123456789012:role/s3-read-only
+#AWS_ROLE_SESSION_NAME=nginx-s3-gateway
+#STS_ENDPOINT=https://sts.us-east-1.amazonaws.com
+# AssumeRole requests are signed with AWS_REGION, else S3_REGION, else
+# us-east-1; set AWS_REGION when the STS endpoint's region differs.
+#AWS_REGION=us-east-1
 S3_SERVER=s3.us-east-1.amazonaws.com
 S3_SERVER_PORT=443
 S3_SERVER_PROTO=https
+S3_TRUSTED_CERT_PATH=/etc/ssl/certs/ca-certificates.crt
 S3_REGION=us-east-1
 S3_STYLE=virtual-v2
 S3_SERVICE=s3
@@ -16,6 +31,7 @@ ALLOW_DIRECTORY_LIST=false
 PROVIDE_INDEX_PAGE=false
 APPEND_SLASH_FOR_POSSIBLE_DIRECTORY=false
 DIRECTORY_LISTING_PATH_PREFIX=""
+DIRECTORY_LISTING_PAGE_SIZE=""
 PROXY_CACHE_MAX_SIZE=10g
 PROXY_CACHE_SLICE_SIZE="1m"
 PROXY_CACHE_INACTIVE=60m
@@ -23,4 +39,7 @@ PROXY_CACHE_VALID_OK=1h
 PROXY_CACHE_VALID_NOTFOUND=1m
 PROXY_CACHE_VALID_FORBIDDEN=30s
 PROXY_CACHE_USE_STALE='error timeout http_500 http_502 http_503 http_504'
+PROXY_CACHE_BYPASS_NO_CACHE=false
+PROXY_CACHE_IGNORE_HEADERS=''
+ACCESS_LOG_CACHE_STATUS=false
 STRIP_LEADING_DIRECTORY_PATH=/somepath

@@ -19,12 +19,63 @@
  * @alias Utils
  */
 
+const fs = require('fs');
+
+/**
+ * The current moment as a timestamp. This timestamp will be used across
+ * functions in order for there to be no variations in signatures.
+ *
+ * This constant exists solely for signature-timestamp stability and is stable
+ * per njs VM context, not per wall-clock moment. Never use it for freshness
+ * or expiry decisions: if module scope persists across requests (e.g. the
+ * QuickJS engine with context reuse), it freezes at context-creation time.
+ *
+ * It lives here rather than in awscredentials.js so that awssig4.js can read
+ * it without importing awscredentials.js - njs cannot resolve circular
+ * imports, and awscredentials.js needs to import awssig4.js to sign its STS
+ * requests.
+ * @type {Date}
+ */
+const NOW = new Date();
+
+/**
+ * The canonical boolean spellings, matched case-insensitively. This is the
+ * same grammar the shell-side helpers in /etc/nginx/gateway_env_lib.sh
+ * accept, and test_entrypoint_boolean_validation.sh pins the two
+ * implementations against each other - change them together.
+ *
+ * Declared ahead of the DEBUG constant below: parseBoolean runs at module
+ * scope for DEBUG, so the tables it reads must already be initialized.
+ */
+const BOOLEAN_TRUE_VALUES = ['true', 'yes', '1'];
+const BOOLEAN_FALSE_VALUES = ['false', 'no', '0'];
+
 /**
  * Flag indicating debug mode operation. If true, additional information
  * about signature generation will be logged.
  * @type {boolean}
  */
 const DEBUG = parseBoolean(process.env['DEBUG']);
+
+/**
+ * Suffix appended to a setting's environment variable name to form the name of
+ * the variable that instead points at a file holding the setting's value. This
+ * is the convention used by container secret stores, which mount each secret
+ * as a read-only file rather than exposing it in the environment.
+ * @see {@link https://docs.docker.com/engine/swarm/secrets/ | Manage sensitive data with Docker secrets}
+ * @type {string}
+ */
+const ENV_VAR_FILE_SUFFIX = '_FILE';
+
+/**
+ * Values already read from the files named by '<setting>_FILE' environment
+ * variables, keyed by setting name. Reading once means the several credential
+ * lookups made while serving a single request share one file read. As with the
+ * NOW constant above, module scope lasts as long as the njs VM context rather
+ * than the worker process, so this is not a cross-request cache.
+ * @type {Object.<string, string>}
+ */
+let envVarFileCache = {};
 
 
 /**
@@ -48,6 +99,68 @@ function areAllEnvVarsSet(envVars) {
 }
 
 /**
+ * Reads a configuration setting that is supplied either directly in the
+ * environment variable 'name' or indirectly through a file whose path is held
+ * in the companion '<name>_FILE' variable. The direct variable wins when both
+ * are set; the container entrypoint rejects that combination outright, but the
+ * systemd install has no equivalent check.
+ *
+ * File contents are trimmed for the same reason the web identity and EKS pod
+ * identity token files are: a secret written with a text editor almost always
+ * ends in a newline, and a credential with a trailing newline invalidates
+ * every signature the gateway produces.
+ *
+ * @param name {string} name of the environment variable holding the setting
+ * @returns {string|undefined} the setting's value, or undefined when neither
+ *          the variable nor its companion file variable holds a value
+ */
+function readEnvVarOrFile(name) {
+    const direct = process.env[name];
+    if (direct) {
+        return direct;
+    }
+
+    const fileVarName = name + ENV_VAR_FILE_SUFFIX;
+    const path = process.env[fileVarName];
+    if (!path) {
+        return undefined;
+    }
+
+    if (name in envVarFileCache) {
+        return envVarFileCache[name];
+    }
+
+    let contents;
+    try {
+        contents = fs.readFileSync(path).toString().trim();
+    } catch (e) {
+        /* Name the setting and the path but never the contents - this error
+           reaches the NGINX error log. */
+        throw `Could not read ${fileVarName} (${path}): ${e}`;
+    }
+
+    if (contents.length === 0) {
+        /* An empty value satisfies every presence check downstream and then
+           fails at the S3 origin as an opaque 403, so reject it here where the
+           cause is still obvious. */
+        throw `${fileVarName} refers to an empty file (${path})`;
+    }
+
+    envVarFileCache[name] = contents;
+    return contents;
+}
+
+/**
+ * Discards the values memoized by readEnvVarOrFile so that a subsequent read
+ * goes back to the file.
+ *
+ * @private
+ */
+function resetEnvVarFileCache() {
+    envVarFileCache = {};
+}
+
+/**
  * Parses a string delimited by semicolons into an array of values
  * @param string {string|null} value representing a array of strings
  * @returns {Array<String>} a list of values
@@ -66,25 +179,18 @@ function parseArray(string) {
 }
 
 /**
- * Parses a string to and returns a boolean value based on its value. If the
- * string can't be parsed, this method returns false.
+ * Parses a value to a boolean: true for the spellings in
+ * BOOLEAN_TRUE_VALUES in any letter case, false for everything else.
+ * Unrecognized spellings mean false here so that startup validation
+ * (00-check-for-required-env.sh), not parsing, is the single place that
+ * rejects them - and so unset env vars and nginx js_var defaults keep
+ * parsing cleanly.
  *
- * @param string {*} value representing a boolean
- * @returns {boolean} boolean value of string
+ * @param value {*} value representing a boolean
+ * @returns {boolean} boolean value of value
  */
-function parseBoolean(string) {
-    switch(string) {
-        case "TRUE":
-        case "true":
-        case "True":
-        case "YES":
-        case "yes":
-        case "Yes":
-        case "1":
-            return true;
-        default:
-            return false;
-    }
+function parseBoolean(value) {
+    return BOOLEAN_TRUE_VALUES.indexOf(String(value).toLowerCase()) !== -1;
 }
 
 /**
@@ -152,6 +258,20 @@ function getEightDigitDate(timestamp) {
         padWithLeadingZeros(day,2));
 }
 
+/**
+ * Get the timestamp used across functions in order for there to be no
+ * variations in signatures.
+ *
+ * The returned value is the module-level NOW constant, which is stable per
+ * njs VM context rather than the current wall-clock moment. Never use it for
+ * freshness or expiry decisions - see the note on NOW.
+ *
+ * @returns {Date} signature-stable timestamp for the current VM context
+ */
+function Now() {
+    return NOW;
+}
+
 
 /**
  * Checks to see if the given environment variable is present. If not, an error
@@ -168,12 +288,20 @@ function requireEnvVar(envVarName) {
 }
 
 export default {
+    Now,
     areAllEnvVarsSet,
     debug_log,
+    debugEnabled: DEBUG,
     getAmzDatetime,
     getEightDigitDate,
     padWithLeadingZeros,
     parseArray,
     parseBoolean,
-    requireEnvVar
+    readEnvVarOrFile,
+    requireEnvVar,
+    // These functions do not need to be exposed, but they are exposed so that
+    // unit tests can run against them.
+    resetEnvVarFileCache,
+    BOOLEAN_TRUE_VALUES,
+    BOOLEAN_FALSE_VALUES
 }

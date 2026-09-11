@@ -1,7 +1,7 @@
 # Pull from NGINX image that provides the XSLT module and supporting libraries
-FROM private-registry.nginx.com/nginx-plus/modules:r35-xslt-debian@sha256:3eaa85dca47e31b9a6648bcaf6034f076cd59be9b1510b25fd1bbe1144f0bb48 AS xslt
+FROM private-registry.nginx.com/nginx-plus/modules:r37.0-xslt-debian@sha256:0b4c950977bb5670f450c4c5428e9d4e931e12919dd97e72517c6ab8d5d52501 AS xslt
 
-FROM private-registry.nginx.com/nginx-plus/base:r35-debian-bookworm@sha256:9a82ad3f96d58be861257efd621f215d599e226ebedd24d9f3211bdd743c3c27
+FROM private-registry.nginx.com/nginx-plus/base:r37.0-debian-trixie@sha256:00bdd05087c951211a1bec52c90bd76ddbe82b4b6be7405beaaa605e5b950a3e
 
 # Proxy cache env vars
 ENV PROXY_CACHE_MAX_SIZE=10g
@@ -10,6 +10,18 @@ ENV PROXY_CACHE_SLICE_SIZE=1m
 ENV PROXY_CACHE_VALID_OK=1h
 ENV PROXY_CACHE_VALID_NOTFOUND=1m
 ENV PROXY_CACHE_VALID_FORBIDDEN=30s
+ENV PROXY_CACHE_BYPASS_NO_CACHE=false
+ENV PROXY_CACHE_IGNORE_HEADERS=""
+
+# Access log env vars
+ENV ACCESS_LOG_CACHE_STATUS=false
+
+# Restrict the base image's template renderer (20-envsubst-on-templates.sh) to
+# ALL-CAPS variable names: every gateway setting is uppercase, while the nginx
+# runtime variables the templates must keep literally ($status, $remote_addr,
+# $upstream_cache_status, ...) are lowercase and would otherwise be rewritten
+# whenever a same-named environment variable happens to be set.
+ENV NGINX_ENVSUBST_FILTER="^[A-Z0-9_]+$"
 
 # CORS env vars
 ENV CORS_ENABLED=0
@@ -17,6 +29,7 @@ ENV CORS_ALLOW_PRIVATE_NETWORK_ACCESS=""
 
 # S3 proxy env vars
 ENV DIRECTORY_LISTING_PATH_PREFIX=""
+ENV DIRECTORY_LISTING_PAGE_SIZE=""
 ENV STRIP_LEADING_DIRECTORY_PATH=""
 ENV PREFIX_LEADING_DIRECTORY_PATH=""
 

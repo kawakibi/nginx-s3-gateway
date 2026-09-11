@@ -1,4 +1,4 @@
-FROM nginx:1.29.1@sha256:d5f28ef21aabddd098f3dbc21fe5b7a7d7a184720bc07da0b6c9b9820e97f25e
+FROM nginx:1.31.5@sha256:05b8cb60c354a44ab824ea6e7dc69b46d50762cdbe728a347a5b656e6fb3d7c4
 
 # Proxy cache env vars
 ENV PROXY_CACHE_MAX_SIZE=10g
@@ -7,6 +7,18 @@ ENV PROXY_CACHE_SLICE_SIZE=1m
 ENV PROXY_CACHE_VALID_OK=1h
 ENV PROXY_CACHE_VALID_NOTFOUND=1m
 ENV PROXY_CACHE_VALID_FORBIDDEN=30s
+ENV PROXY_CACHE_BYPASS_NO_CACHE=false
+ENV PROXY_CACHE_IGNORE_HEADERS=""
+
+# Access log env vars
+ENV ACCESS_LOG_CACHE_STATUS=false
+
+# Restrict the base image's template renderer (20-envsubst-on-templates.sh) to
+# ALL-CAPS variable names: every gateway setting is uppercase, while the nginx
+# runtime variables the templates must keep literally ($status, $remote_addr,
+# $upstream_cache_status, ...) are lowercase and would otherwise be rewritten
+# whenever a same-named environment variable happens to be set.
+ENV NGINX_ENVSUBST_FILTER="^[A-Z0-9_]+$"
 
 # CORS env vars
 ENV CORS_ENABLED=0
@@ -14,6 +26,7 @@ ENV CORS_ALLOW_PRIVATE_NETWORK_ACCESS=""
 
 # S3 proxy env vars
 ENV DIRECTORY_LISTING_PATH_PREFIX=""
+ENV DIRECTORY_LISTING_PAGE_SIZE=""
 ENV STRIP_LEADING_DIRECTORY_PATH=""
 ENV PREFIX_LEADING_DIRECTORY_PATH=""
 
