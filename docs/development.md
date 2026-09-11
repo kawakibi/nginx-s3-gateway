@@ -106,12 +106,16 @@ Other useful targets:
   `common/etc/nginx/include/*.js` use `make test` to rebuild first.
 - `make test-unit` / `make test-integration` — run just the unit or just the
   integration half of the suite against the already-built image.
+- `make test-dynamic-buckets` — run the fork's entrypoint and two-bucket
+  integration checks against the already-built image. This phase always uses
+  path-style addressing and also runs within every full integration matrix leg.
 - `make test-latest-njs` / `make test-unprivileged` — build and test the
   image variants.
 - `make test-matrix` — reproduce the CI matrix locally.
 - `make test S3_STYLE=path` (or `virtual` / `virtual-v2`) — reproduce a single
   CI matrix leg; plain `make test` covers only the default `virtual-v2` style.
-- `make lint` — run the linters (checkmake + shellcheck).
+- `make lint` — run the linters (checkmake, shellcheck, and rumdl) and shared
+  environment helper consistency checks.
 
 Run `make help` for the full target list.
 
@@ -142,7 +146,7 @@ gateway configurations, including HTTPS origins with TLS verification and a
 CORS-enabled phase. New
 shell scripts under `test/` and `test/integration/` are picked up by
 `make lint` automatically and must pass `shellcheck --severity=warning`.
-Six of the eight `test_entrypoint_*.sh` scripts source
+Most `test_entrypoint_*.sh` scripts source
 `test/integration/entrypoint_test_lib.sh` for the shared `docker run` wrapper and
 the validation and banner assertions; the baseline container environment lives
 there, so a newly required gateway variable is added in one place. The other two

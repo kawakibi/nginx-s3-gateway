@@ -30,7 +30,7 @@ failed=0
 
 required=("S3_BUCKET_NAME" "S3_SERVER" "S3_SERVER_PORT" "S3_SERVER_PROTO"
 "S3_REGION" "S3_STYLE" "ALLOW_DIRECTORY_LIST" "AWS_SIGS_VERSION"
-"CORS_ENABLED" "ALLOW_DYNAMIC_BUCKET_NAME")
+"CORS_ENABLED")
 
 # Each static credential may be supplied either in its own environment
 # variable or, following the container secret-store convention, in a file named
@@ -341,9 +341,17 @@ fi
 for name in ALLOW_DIRECTORY_LIST PROVIDE_INDEX_PAGE \
     APPEND_SLASH_FOR_POSSIBLE_DIRECTORY FOUR_O_FOUR_ON_EMPTY_BUCKET DEBUG \
     AWS_EC2_METADATA_V1_DISABLED CORS_ENABLED PROXY_CACHE_BYPASS_NO_CACHE \
-    ACCESS_LOG_CACHE_STATUS; do
+    ACCESS_LOG_CACHE_STATUS ALLOW_DYNAMIC_BUCKET_NAME; do
   validateBooleanVar "${name}" "${!name:-}" || failed=1
 done
+
+# Bucket-qualified upstream hosts are fixed at startup in virtual styles.
+# Reject dynamic mode there instead of signing for a different bucket.
+if [ "$(parseBoolean "${ALLOW_DYNAMIC_BUCKET_NAME:-false}")" = "1" ] && \
+   [ "${S3_STYLE}" != "path" ]; then
+  >&2 echo "ALLOW_DYNAMIC_BUCKET_NAME requires S3_STYLE=path"
+  failed=1
+fi
 
 validateBooleanVar CORS_ALLOW_PRIVATE_NETWORK_ACCESS \
   "${CORS_ALLOW_PRIVATE_NETWORK_ACCESS:-}" \

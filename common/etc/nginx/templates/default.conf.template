@@ -87,6 +87,8 @@ js_set $s3auth s3gateway.s3auth;
 js_set $awsSessionToken awscredentials.sessionToken;
 js_set $s3uri s3gateway.s3uri;
 js_set $s3_bucket_name s3gateway.getBucketName;
+js_set $s3_bucket_missing s3gateway.missingBucketHeader;
+js_set $s3_cors_bucket_header s3gateway.corsBucketHeader;
 js_set $trailslash_redirect_uri s3gateway.trailslashRedirectUri;
 
 server {
@@ -98,6 +100,13 @@ server {
     # installs never run the entrypoint scripts.
     listen       80;
     include /etc/nginx/conf.d/gateway/server_variables.conf;
+
+    # Check before location selection, including the index.html regex. A
+    # missing bucket must never reach a warm cache or a signed S3 request.
+    error_page 500 =500 @error500;
+    if ($s3_bucket_missing) {
+        return 500;
+    }
 
     # Don't display the NGINX version number because we don't want to reveal
     # information that could be used to find an exploit.

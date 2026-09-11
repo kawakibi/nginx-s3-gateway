@@ -388,9 +388,17 @@ esac
 for name in ALLOW_DIRECTORY_LIST PROVIDE_INDEX_PAGE \
     APPEND_SLASH_FOR_POSSIBLE_DIRECTORY FOUR_O_FOUR_ON_EMPTY_BUCKET DEBUG \
     AWS_EC2_METADATA_V1_DISABLED CORS_ENABLED PROXY_CACHE_BYPASS_NO_CACHE \
-    ACCESS_LOG_CACHE_STATUS; do
+    ACCESS_LOG_CACHE_STATUS ALLOW_DYNAMIC_BUCKET_NAME; do
   validateBooleanVar "${name}" "${!name:-}" || failed=1
 done
+
+# Bucket-qualified upstream hosts are fixed at startup in virtual styles.
+# Reject dynamic mode there instead of signing for a different bucket.
+if [ "$(parseBoolean "${ALLOW_DYNAMIC_BUCKET_NAME:-false}")" = "1" ] && \
+   [ "${S3_STYLE}" != "path" ]; then
+  >&2 echo "ALLOW_DYNAMIC_BUCKET_NAME requires S3_STYLE=path"
+  failed=1
+fi
 
 validateBooleanVar CORS_ALLOW_PRIVATE_NETWORK_ACCESS \
   "${CORS_ALLOW_PRIVATE_NETWORK_ACCESS:-}" \
@@ -517,6 +525,8 @@ echo "Proxy Cache Using Stale: ${PROXY_CACHE_USE_STALE}"
 echo "Proxy Cache Bypass on Cache-Control no-cache: ${PROXY_CACHE_BYPASS_NO_CACHE}"
 echo "Proxy Cache Ignoring S3 Response Headers: ${PROXY_CACHE_IGNORE_HEADERS:-}"
 echo "Access log includes upstream cache status: ${ACCESS_LOG_CACHE_STATUS}"
+echo "Dynamic Bucket Name Enabled: ${ALLOW_DYNAMIC_BUCKET_NAME:-false}"
+echo "Dynamic Bucket Name Source Header: ${HEADER_DYNAMIC_BUCKET_NAME:-X-Bucket-Name}"
 echo "CORS Enabled: ${CORS_ENABLED}"
 echo "CORS Allow Private Network Access: ${CORS_ALLOW_PRIVATE_NETWORK_ACCESS}"
 
@@ -644,6 +654,9 @@ DIRECTORY_LISTING_PAGE_SIZE=${DIRECTORY_LISTING_PAGE_SIZE:-''}
 AWS_SIGS_VERSION=${AWS_SIGS_VERSION}
 # Name of S3 bucket to proxy requests to
 S3_BUCKET_NAME=${S3_BUCKET_NAME}
+# Dynamic bucket selection is supported with path-style addressing only.
+ALLOW_DYNAMIC_BUCKET_NAME=${ALLOW_DYNAMIC_BUCKET_NAME:-false}
+HEADER_DYNAMIC_BUCKET_NAME=${HEADER_DYNAMIC_BUCKET_NAME:-X-Bucket-Name}
 # Region associated with API
 S3_REGION=${S3_REGION}
 # SSL/TLS port to connect to
@@ -1034,6 +1047,8 @@ env AWS_REGION;
 env AWS_WEB_IDENTITY_TOKEN_FILE;
 env AWS_EC2_METADATA_V1_DISABLED;
 env S3_BUCKET_NAME;
+env ALLOW_DYNAMIC_BUCKET_NAME;
+env HEADER_DYNAMIC_BUCKET_NAME;
 env S3_SERVER;
 env S3_SERVER_PORT;
 env S3_SERVER_PROTO;

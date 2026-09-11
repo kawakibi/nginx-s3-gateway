@@ -84,8 +84,8 @@ S3 Backend Environment:
   CORS Enabled: ${CORS_ENABLED}
   CORS Allow Private Network Access: ${CORS_ALLOW_PRIVATE_NETWORK_ACCESS}
   Proxy cache using stale setting: ${PROXY_CACHE_USE_STALE}
-  Dynamic Bucket Name Enabled: ${ALLOW_DYNAMIC_BUCKET_NAME}
-  Dynamic Bucket Name Source Header: ${HEADER_DYNAMIC_BUCKET_NAME}
+  Dynamic Bucket Name Enabled: ${ALLOW_DYNAMIC_BUCKET_NAME:-false}
+  Dynamic Bucket Name Source Header: ${HEADER_DYNAMIC_BUCKET_NAME:-X-Bucket-Name}
   Proxy cache bypass on Cache-Control no-cache: ${PROXY_CACHE_BYPASS_NO_CACHE}
   Proxy cache ignoring these S3 response headers: ${PROXY_CACHE_IGNORE_HEADERS}
   Access log includes upstream cache status: ${ACCESS_LOG_CACHE_STATUS}

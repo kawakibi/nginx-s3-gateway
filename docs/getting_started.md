@@ -14,13 +14,31 @@
 
 ## Configuration
 
-The following environment variables are used to configure the handling of dynamic bucket names via a header
+### Dynamic bucket selection
 
-| Name                                  | Required? | Allowed Values               | Default             | Description                                                                                 |
-| ------------------------------------- | --------- | ---------------------------- | ------------------- | ------------------------------------------------------------------------------------------- |
-| `ALLOW_DYNAMIC_BUCKET_NAME`              | Yes       | `true`, `false`              | `false`             | Flag enabling dynamic bucket name via header                                                |
-| `HEADER_DYNAMIC_BUCKET_NAME`       | No        |                              | `X-Bucket-Name`     | Header Name for Getting Bucket name                                                         |
+| Name                         | Required? | Default         | Description                                                                                                                      |
+| ---------------------------- | --------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `ALLOW_DYNAMIC_BUCKET_NAME`  | No        | `false`         | Select the bucket from a request header. Requires `S3_STYLE=path` when enabled. Uses the shared boolean grammar described below. |
+| `HEADER_DYNAMIC_BUCKET_NAME` | No        | `X-Bucket-Name` | Case-insensitive request header containing the bucket name. An unset or empty setting uses the default header.                   |
 
+Static mode ignores the bucket header and uses `S3_BUCKET_NAME`. Dynamic mode requires a non-empty
+bucket header for every S3 GET or HEAD, including index pages and range requests; it never falls back
+to `S3_BUCKET_NAME`. A missing or empty header returns HTTP 500, preserving this fork's existing
+contract, before cache lookup or S3 access. `S3_BUCKET_NAME` remains a required startup setting.
+Health checks and CORS preflight do not require the header. When CORS is enabled, the configured
+bucket header is included in the allowed request headers.
+
+For example, configure `ALLOW_DYNAMIC_BUCKET_NAME=true`, `S3_STYLE=path`, and
+`HEADER_DYNAMIC_BUCKET_NAME=X-Custom-Bucket-Name`, then request:
+
+```shell
+curl -H 'X-Custom-Bucket-Name: my-bucket' http://localhost:8080/private/video.mp4
+```
+
+The selected bucket is used for signing, listings, internal index probes, and the effective S3 URI
+in both ordinary and sliced cache keys. The `s3gw-v2` cache namespace replaces the previous fork's
+cache keys, so existing cache entries are not reused after this upgrade. Dynamic mode with virtual
+addressing fails startup; static mode retains upstream's addressing-style support.
 
 The following environment variables are used to configure the gateway when
 running as a Container or as a Systemd service.
