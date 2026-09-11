@@ -341,9 +341,17 @@ fi
 for name in ALLOW_DIRECTORY_LIST PROVIDE_INDEX_PAGE \
     APPEND_SLASH_FOR_POSSIBLE_DIRECTORY FOUR_O_FOUR_ON_EMPTY_BUCKET DEBUG \
     AWS_EC2_METADATA_V1_DISABLED CORS_ENABLED PROXY_CACHE_BYPASS_NO_CACHE \
-    ACCESS_LOG_CACHE_STATUS; do
+    ACCESS_LOG_CACHE_STATUS ALLOW_DYNAMIC_BUCKET_NAME; do
   validateBooleanVar "${name}" "${!name:-}" || failed=1
 done
+
+# Bucket-qualified upstream hosts are fixed at startup in virtual styles.
+# Reject dynamic mode there instead of signing for a different bucket.
+if [ "$(parseBoolean "${ALLOW_DYNAMIC_BUCKET_NAME:-false}")" = "1" ] && \
+   [ "${S3_STYLE}" != "path" ]; then
+  >&2 echo "ALLOW_DYNAMIC_BUCKET_NAME requires S3_STYLE=path"
+  failed=1
+fi
 
 validateBooleanVar CORS_ALLOW_PRIVATE_NETWORK_ACCESS \
   "${CORS_ALLOW_PRIVATE_NETWORK_ACCESS:-}" \

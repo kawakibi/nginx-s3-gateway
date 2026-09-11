@@ -85,6 +85,12 @@ const ADDITIONAL_HEADER_PREFIXES_ALLOWED = utils.parseArray(process.env['HEADER_
 const INDEX_PAGE = "index.html";
 
 /**
+ * Default request header used for dynamic bucket selection.
+ * @type {string}
+ */
+const DEFAULT_BUCKET_HEADER = 'X-Bucket-Name';
+
+/**
  * Constant defining the service requests are being signed for.
  * @type {string}
  */
@@ -211,7 +217,7 @@ function s3date(r) {
  * @returns {string} AWS authentication signature
  */
 function s3auth(r) {
-    const bucket = process.env['S3_BUCKET_NAME'];
+    const bucket = getBucketName(r);
     const region = process.env['S3_REGION'];
     const host = r.variables.s3_host;
     const sigver = process.env['AWS_SIGS_VERSION'];
@@ -340,7 +346,7 @@ function _s3ReqParamsForSigV4(r, bucket, host) {
  * @returns {string} start of the file path for the S3 object URI
  */
 function s3BaseUri(r) {
-    const bucket = process.env['S3_BUCKET_NAME'];
+    const bucket = getBucketName(r);
     // Valid S3_STYLE values are 'virtual', 'virtual-v2' and 'path'; anything
     // else behaves as virtual-style. Read per call (like S3_BUCKET_NAME
     // above) rather than into an import-time const so unit tests can
@@ -592,6 +598,13 @@ function redirectToS3(r) {
         return;
     }
 
+    // Also guard direct njs callers; HTTP requests are checked before cache
+    // lookup in the server rewrite phase, including direct index-page reads.
+    if (missingBucketHeader(r)) {
+        r.internalRedirect('@error500');
+        return;
+    }
+
     /* Route on the same normalized path that s3uri() will proxy. In
      * particular 'GET //' must collapse to '/' and hit the root guard
      * below - uncollapsed it would bypass the uriPath === "/" check and
@@ -743,8 +756,16 @@ async function loadContent(r) {
     // second time on re-entry.
     const uri = s3uri(r, { preserveBasePath: true });
 
+    // A loopback HTTP request does not inherit the viewer's headers. Forward
+    // only bucket selection when probing our own index URL.
+    const options = {};
+    if (utils.parseBoolean(process.env['ALLOW_DYNAMIC_BUCKET_NAME'])) {
+        options.headers = {};
+        options.headers[_bucketHeaderName()] = getBucketName(r);
+    }
+
     let reply = await ngx.fetch(
-        `http://127.0.0.1:80${uri}`
+        `http://127.0.0.1:80${uri}`, options
     );
 
     if (reply.status === 200) {
@@ -910,6 +931,78 @@ function _requireEnvVars(envVarName) {
     }
 }
 
+/**
+ * Retrieves the bucket name to use for the request. If dynamic bucket names
+ * are not enabled, the static bucket name from the environment variable is
+ * returned. If dynamic bucket names are enabled, the bucket name is read
+ * from the specified HTTP header.
+ *
+ * @param r {NginxHTTPRequest} HTTP request
+ * @returns {string|undefined} bucket name to use for request
+ */
+function getBucketName(r) {
+    if (!utils.parseBoolean(process.env['ALLOW_DYNAMIC_BUCKET_NAME'])) {
+        return process.env['S3_BUCKET_NAME'];
+    }
+
+    const headerName = _bucketHeaderName();
+    if (!r.headersIn) {
+        return undefined;
+    }
+    // njs headersIn is case-insensitive. This fallback also supports plain
+    // request objects used by tests and other callers of these helpers.
+    if (r.headersIn[headerName] !== undefined) {
+        return r.headersIn[headerName];
+    }
+    for (let name in r.headersIn) {
+        if (name.toLowerCase() === headerName.toLowerCase()) {
+            return r.headersIn[name];
+        }
+    }
+    return undefined;
+}
+
+/**
+ * Whether a read needs a bucket header before cache lookup or signing.
+ * Local health/denial endpoints and credential subrequests do not access S3.
+ * @param r {NginxHTTPRequest} HTTP request
+ * @returns {string} '1' when missing, otherwise empty (an nginx false value)
+ */
+function missingBucketHeader(r) {
+    if (!utils.parseBoolean(process.env['ALLOW_DYNAMIC_BUCKET_NAME']) ||
+        (r.method !== 'GET' && r.method !== 'HEAD')) {
+        return '';
+    }
+    const uri = r.uri || '';
+    // The index.html regex wins over the /health and /soap prefix locations:
+    // those prefixes must not exempt an index-page request from this guard.
+    const isLocalPrefix = uri.indexOf('/health') === 0 || uri.indexOf('/soap') === 0;
+    if ((isLocalPrefix && !/\/index\.html$/.test(uri)) ||
+        uri === '/aws/credentials/retrieve') {
+        return '';
+    }
+    return getBucketName(r) ? '' : '1';
+}
+
+/**
+ * Append the configured bucket header to CORS's allowed request headers.
+ * @param _r {NginxHTTPRequest} HTTP request (not used, but required for NGINX configuration)
+ * @returns {string} comma-prefixed header name, or empty in static mode
+ */
+function corsBucketHeader(_r) {
+    return utils.parseBoolean(process.env['ALLOW_DYNAMIC_BUCKET_NAME'])
+        ? ',' + _bucketHeaderName() : '';
+}
+
+/**
+ * Resolve the header name for bucket selection and loopback probes.
+ * @returns {string} configured or default bucket header name
+ * @private
+ */
+function _bucketHeaderName() {
+    return process.env['HEADER_DYNAMIC_BUCKET_NAME'] || DEFAULT_BUCKET_HEADER;
+}
+
 export default {
     s3date,
     s3auth,
@@ -921,6 +1014,9 @@ export default {
     editHeaders,
     filterListResponse,
     loadContent,
+    getBucketName,
+    missingBucketHeader,
+    corsBucketHeader,
     // These functions do not need to be exposed, but they are exposed so that
     // unit tests can run against them.
     _s3DirQueryParams,

@@ -20,6 +20,7 @@ concurrency:
 
 jobs:
   update_release_draft:
+    if: github.repository == 'nginx/nginx-s3-gateway'
     permissions:
       # write permission is required to create a github release
       contents: write

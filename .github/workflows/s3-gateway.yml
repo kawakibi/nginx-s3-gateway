@@ -172,7 +172,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: [test-oss, test-latest-njs, test-unprivileged]
-    if: github.ref == 'refs/heads/main'
+    if: github.repository == 'nginx/nginx-s3-gateway' && github.ref == 'refs/heads/main'
     permissions:
       id-token: write
       contents: read
@@ -240,7 +240,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: publish-base
-    if: github.ref == 'refs/heads/main'
+    if: github.repository == 'nginx/nginx-s3-gateway' && github.ref == 'refs/heads/main'
     permissions:
       id-token: write
       contents: read
@@ -301,7 +301,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     needs: publish-base
-    if: github.ref == 'refs/heads/main'
+    if: github.repository == 'nginx/nginx-s3-gateway' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
       packages: write
@@ -365,7 +365,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: [publish-base, publish-latest-njs]
-    if: github.ref == 'refs/heads/main'
+    if: github.repository == 'nginx/nginx-s3-gateway' && github.ref == 'refs/heads/main'
     permissions:
       id-token: write
       contents: read

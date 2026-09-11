@@ -66,6 +66,7 @@ fi
 # constants - mutating process.env inside a test cannot change them.
 unit_test_env=(
   -e "DEBUG=true"
+  -e "ALLOW_DYNAMIC_BUCKET_NAME=false"
   -e "S3_STYLE=virtual-v2"
   -e "S3_SERVICE=s3"
   -e "AWS_ACCESS_KEY_ID=unit_test"
@@ -83,6 +84,12 @@ unit_test_env=(
 run_unit_test() {
   test_file="$1"
   shift
+
+  # These are import-time constants; the dedicated suite exercises loopback
+  # index probes without changing the configuration of the upstream suites.
+  if [ "$(basename "${test_file}")" = "dynamic_bucket_test.js" ]; then
+    set -- "$@" -e PROVIDE_INDEX_PAGE=true -e ALLOW_DIRECTORY_LIST=true
+  fi
   # MSYS_NO_PATHCONV=1 stops Git Bash on Windows from rewriting the
   # container-side paths: https://github.com/docker/for-win/issues/6754
   MSYS_NO_PATHCONV=1 "${DOCKER}" run     \

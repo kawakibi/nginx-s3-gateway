@@ -43,6 +43,17 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+# Keep normal upstream phases static even when an operator exports their
+# production settings. The dynamic-bucket phase overrides these per command.
+export ALLOW_DYNAMIC_BUCKET_NAME=false
+export HEADER_DYNAMIC_BUCKET_NAME=X-Bucket-Name
+
+integration_scope=${1:-}
+case "${integration_scope}" in
+  "" | --dynamic-buckets-only) ;;
+  *) >&2 echo "Unknown integration test option: ${integration_scope}"; exit 3 ;;
+esac
+
 nginx_server_proto="http"
 nginx_server_host="localhost"
 nginx_server_port="8989"
@@ -706,6 +717,46 @@ start_tls_gateway() {
   wait_for_gateway
 }
 
+integration_test_dynamic_buckets() {
+  local sigs_version header_name mode
+  for sigs_version in 2 4; do
+    header_name=X-Bucket-Name
+    if [ "${sigs_version}" = 4 ]; then
+      header_name=X-Custom-Bucket-Name
+    fi
+    for mode in objects listing; do
+      local listing=0 prefix="" strip=""
+      if [ "${mode}" = listing ]; then
+        listing=1
+        prefix=/internal
+        strip=/viewer
+      fi
+      p "Testing dynamic buckets (${mode}, SigV${sigs_version})"
+      COMPOSE_COMPATIBILITY=true S3_STYLE=path ALLOW_DYNAMIC_BUCKET_NAME=true \
+        HEADER_DYNAMIC_BUCKET_NAME="${header_name}" AWS_SIGS_VERSION="${sigs_version}" \
+        ALLOW_DIRECTORY_LIST="${listing}" PROVIDE_INDEX_PAGE="${listing}" \
+        APPEND_SLASH_FOR_POSSIBLE_DIRECTORY="${listing}" \
+        STRIP_LEADING_DIRECTORY_PATH="${strip}" PREFIX_LEADING_DIRECTORY_PATH="${prefix}" \
+        DIRECTORY_LISTING_PAGE_SIZE=1 TEST_PROXY_CACHE_SLICE_SIZE=1k \
+        CORS_ENABLED=false PROXY_CACHE_BYPASS_NO_CACHE=false PROXY_CACHE_IGNORE_HEADERS="" \
+        compose up -d --force-recreate nginx-s3-gateway
+      wait_for_gateway
+      bash "${test_dir}/integration/test_dynamic_bucket.sh" "${test_server}" \
+        "${s3_origin_server}" "${s3_origin_user}" "${s3_origin_passwd}" "${header_name}" "${mode}"
+      assert_gateway_sig_version "${sigs_version}"
+    done
+  done
+  COMPOSE_COMPATIBILITY=true S3_STYLE=path ALLOW_DYNAMIC_BUCKET_NAME=true \
+    HEADER_DYNAMIC_BUCKET_NAME=X-Custom-Bucket-Name AWS_SIGS_VERSION=4 \
+    ALLOW_DIRECTORY_LIST=false PROVIDE_INDEX_PAGE=false APPEND_SLASH_FOR_POSSIBLE_DIRECTORY=false \
+    STRIP_LEADING_DIRECTORY_PATH="" PREFIX_LEADING_DIRECTORY_PATH="" DIRECTORY_LISTING_PAGE_SIZE="" \
+    CORS_ENABLED=true CORS_ALLOWED_ORIGIN=https://viewer.example \
+    compose up -d --force-recreate nginx-s3-gateway
+  wait_for_gateway
+  bash "${test_dir}/integration/test_dynamic_bucket.sh" "${test_server}" \
+    "${s3_origin_server}" "${s3_origin_user}" "${s3_origin_passwd}" X-Custom-Bucket-Name cors
+}
+
 integration_test_proxy_ssl() {
   p "Testing HTTPS S3 origin certificate verification"
   generate_tls_test_certs
@@ -918,6 +969,17 @@ finish() {
 }
 trap finish EXIT ERR SIGTERM SIGINT
 
+# A make target provides a fast regression loop without changing the full
+# matrix's default coverage or reading a potentially inherited filter env var.
+if [ "${integration_scope}" = --dynamic-buckets-only ]; then
+  bash "${test_dir}/integration/test_entrypoint_dynamic_bucket.sh" "${docker_cmd}"
+  mkdir -p "${test_tls_cert_dir}"
+  set_http_test_origin
+  AWS_SIGS_VERSION=4 ALLOW_DIRECTORY_LIST=false integration_test_data
+  integration_test_dynamic_buckets
+  exit 0
+fi
+
 ### ENTRYPOINT SCRIPT TESTS
 # These only need the image and a docker CLI, so they run before the compose
 # environment comes up.
@@ -936,6 +998,9 @@ bash "${test_dir}/integration/test_entrypoint_access_log_cache_status.sh" "${doc
 
 p "Testing boolean validation entrypoint scripts"
 bash "${test_dir}/integration/test_entrypoint_boolean_validation.sh" "${docker_cmd}"
+
+p "Testing dynamic bucket entrypoint validation"
+bash "${test_dir}/integration/test_entrypoint_dynamic_bucket.sh" "${docker_cmd}"
 
 p "Testing file-backed credential entrypoint scripts"
 bash "${test_dir}/integration/test_entrypoint_secret_files.sh" "${docker_cmd}"
@@ -1074,6 +1139,8 @@ compose stop nginx-s3-gateway # Restart with new config
 
 p "Testing CORS contract with CORS_ENABLED=true"
 integration_test_cors
+
+integration_test_dynamic_buckets
 
 integration_test_proxy_ssl
 

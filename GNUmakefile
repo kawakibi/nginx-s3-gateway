@@ -72,7 +72,7 @@ SHELL_SCRIPTS     := test.sh \
 SHELLCHECK_EXCLUDES := SC2027,SC2034,SC2068,SC2140
 
 # Single line on purpose: checkmake's parser does not follow continuations
-.PHONY: help check-tools check-nginx-type check-s3-style check-plus-creds build build-oss build-plus build-latest-njs build-unprivileged test test-unit test-integration test-latest-njs test-unprivileged test-matrix test-matrix-plus retest retest-latest-njs retest-unprivileged lint makefile-check shellcheck envlib-sync-check envlib-sync-selftest lint-md fmt-md hadolint docs docs-open jsdoc clean clean-images all ci
+.PHONY: help check-tools check-nginx-type check-s3-style check-plus-creds build build-oss build-plus build-latest-njs build-unprivileged test test-unit test-integration test-dynamic-buckets test-latest-njs test-unprivileged test-matrix test-matrix-plus retest retest-latest-njs retest-unprivileged lint makefile-check shellcheck envlib-sync-check envlib-sync-selftest lint-md fmt-md hadolint docs docs-open jsdoc clean clean-images all ci
 
 ##@ Help
 
@@ -235,6 +235,10 @@ test-unit: ## Run only the njs unit tests against the currently tagged image
 test-integration: check-nginx-type check-s3-style check-tools ## Run only the integration suite against the currently tagged image
 	$(call NONVARIANT_GUARD,unprivileged)
 	$(RUN_INTEGRATION_TESTS)
+
+test-dynamic-buckets: check-nginx-type check-s3-style check-tools ## Run focused dynamic-bucket integration tests against the built image
+	$(call NONVARIANT_GUARD,unprivileged)
+	$(RUN_INTEGRATION_TESTS) --dynamic-buckets-only
 
 # check-tools fails fast on a missing integration dependency (the AWS CLI,
 # curl, compose, md5sum) before the unit suite spends a minute in docker,
