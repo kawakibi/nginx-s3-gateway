@@ -45,7 +45,6 @@ function testStaticDefault() {
     const r = request('/private/video.mp4', {'X-Bucket-Name': 'ignored'});
     assertEqual(s3gateway.getBucketName(r), process.env['S3_BUCKET_NAME']);
     assertEqual(s3gateway.missingBucketHeader(r), '');
-    assertEqual(s3gateway.corsBucketHeader(r), '');
     process.env['ALLOW_DYNAMIC_BUCKET_NAME'] = 'false';
     assertEqual(s3gateway.getBucketName(r), process.env['S3_BUCKET_NAME']);
 }
@@ -58,7 +57,6 @@ function testBucketSelectionAndSigning() {
     const r = request('/private/video.mp4', {'x-bucket-name': 'bucket-a'});
     assertEqual(s3gateway.getBucketName(r), 'bucket-a');
     assertEqual(s3gateway.s3uri(r), '/bucket-a/private/video.mp4');
-    assertEqual(s3gateway.corsBucketHeader(r), ',X-Bucket-Name');
     process.env['HEADER_DYNAMIC_BUCKET_NAME'] = '';
     assertEqual(s3gateway.getBucketName(r), 'bucket-a');
     process.env['HEADER_DYNAMIC_BUCKET_NAME'] = 'X-Custom-Bucket-Name';
@@ -70,7 +68,6 @@ function testBucketSelectionAndSigning() {
         '/bucket-b/private/video.mp4');
     assertEqual(s3gateway._s3ReqParamsForSigV4(r, 'bucket-b', 'origin:9000').uri,
         '/bucket-b/private/video.mp4');
-    assertEqual(s3gateway.corsBucketHeader(r), ',X-Custom-Bucket-Name');
 }
 
 function testMissingHeaderGuard() {

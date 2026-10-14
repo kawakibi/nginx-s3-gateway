@@ -985,16 +985,6 @@ function missingBucketHeader(r) {
 }
 
 /**
- * Append the configured bucket header to CORS's allowed request headers.
- * @param _r {NginxHTTPRequest} HTTP request (not used, but required for NGINX configuration)
- * @returns {string} comma-prefixed header name, or empty in static mode
- */
-function corsBucketHeader(_r) {
-    return utils.parseBoolean(process.env['ALLOW_DYNAMIC_BUCKET_NAME'])
-        ? ',' + _bucketHeaderName() : '';
-}
-
-/**
  * Resolve the header name for bucket selection and loopback probes.
  * @returns {string} configured or default bucket header name
  * @private
@@ -1016,7 +1006,6 @@ export default {
     loadContent,
     getBucketName,
     missingBucketHeader,
-    corsBucketHeader,
     // These functions do not need to be exposed, but they are exposed so that
     // unit tests can run against them.
     _s3DirQueryParams,

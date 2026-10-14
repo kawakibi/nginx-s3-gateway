@@ -88,7 +88,6 @@ js_set $awsSessionToken awscredentials.sessionToken;
 js_set $s3uri s3gateway.s3uri;
 js_set $s3_bucket_name s3gateway.getBucketName;
 js_set $s3_bucket_missing s3gateway.missingBucketHeader;
-js_set $s3_cors_bucket_header s3gateway.corsBucketHeader;
 js_set $trailslash_redirect_uri s3gateway.trailslashRedirectUri;
 
 server {

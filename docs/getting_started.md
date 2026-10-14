@@ -25,8 +25,9 @@ Static mode ignores the bucket header and uses `S3_BUCKET_NAME`. Dynamic mode re
 bucket header for every S3 GET or HEAD, including index pages and range requests; it never falls back
 to `S3_BUCKET_NAME`. A missing or empty header returns HTTP 500, preserving this fork's existing
 contract, before cache lookup or S3 access. `S3_BUCKET_NAME` remains a required startup setting.
-Health checks and CORS preflight do not require the header. When CORS is enabled, the configured
-bucket header is included in the allowed request headers.
+Health checks and CORS preflight do not require the header. Bucket selection is internal: a trusted
+proxy supplies the configured header on requests to the gateway. CORS responses do not advertise
+the bucket header in `Access-Control-Allow-Headers`.
 
 For example, configure `ALLOW_DYNAMIC_BUCKET_NAME=true`, `S3_STYLE=path`, and
 `HEADER_DYNAMIC_BUCKET_NAME=X-Custom-Bucket-Name`, then request:
