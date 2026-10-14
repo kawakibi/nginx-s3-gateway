@@ -37,6 +37,11 @@ request() {
 assertBody() { cmp -s "$1" "${scratch}/body" || fail "wrong body for $1"; }
 assertContains() { grep -qF "$1" "${scratch}/body" || fail "body lacks $1"; }
 assertLacks() { if grep -qF "$1" "${scratch}/body"; then fail "body unexpectedly contains $1"; fi; }
+assertCorsHeaders() {
+  equal "$(header Access-Control-Allow-Origin)" 'https://viewer.example'
+  equal "$(header Access-Control-Allow-Headers)" \
+    'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range'
+}
 
 for suffix in a b; do
   # 4096 bytes with differing contents; ranges cross the 1k slice boundaries.
@@ -143,16 +148,25 @@ elif [ "${mode}" = listing ]; then
 elif [ "${mode}" = cors ]; then
   request '' /health 200
   for path in /private/video.mp4 /site/index.html; do
-    request '' "${path}" 204 -X OPTIONS -H 'Origin: https://viewer.example' \
-      -H 'Access-Control-Request-Method: GET' \
-      -H "Access-Control-Request-Headers: ${bucket_header}"
-    equal "$(header Access-Control-Allow-Origin)" 'https://viewer.example'
-    case "$(header Access-Control-Allow-Headers)" in
-      *"${bucket_header}"*) ;;
-      *) fail 'preflight does not allow the configured bucket header' ;;
-    esac
+    # Browser preflights must not advertise internal bucket selection, even
+    # when a client explicitly asks to send the internal header.
+    for requested_header in Range "${bucket_header}"; do
+      request '' "${path}" 204 -X OPTIONS -H 'Origin: https://viewer.example' \
+        -H 'Access-Control-Request-Method: GET' \
+        -H "Access-Control-Request-Headers: ${requested_header}"
+      assertCorsHeaders
+    done
+    # A trusted proxy still supplies bucket selection on actual reads.
+    for suffix in a b; do
+      request "dynamic-bucket-${suffix}" "${path}" 200 -H 'Origin: https://viewer.example'
+      assertCorsHeaders
+      request "dynamic-bucket-${suffix}" "${path}" 200 --head -H 'Origin: https://viewer.example'
+      assertCorsHeaders
+    done
     request '' "${path}" 500 -H 'Origin: https://viewer.example'
-    equal "$(header Access-Control-Allow-Origin)" 'https://viewer.example'
+    assertCorsHeaders
+    request '' "${path}" 500 --head -H 'Origin: https://viewer.example'
+    assertCorsHeaders
   done
 else
   fail "unknown test mode: ${mode}"

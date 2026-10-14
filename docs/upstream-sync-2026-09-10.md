@@ -35,7 +35,7 @@ The remaining functional differences from the pinned upstream are:
 - Missing or empty bucket headers return HTTP 500 before cache lookup or
   origin access, including direct index requests. Dynamic mode never falls
   back to `S3_BUCKET_NAME`. Health checks and CORS preflight work without the
-  bucket header; preflight allows the configured header.
+  bucket header; CORS does not advertise this internal header.
 - Responses retain `X-Bucket`, `X-Cache-Status`, and
   `Content-Disposition: inline`.
 

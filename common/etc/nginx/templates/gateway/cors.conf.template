@@ -17,8 +17,9 @@ if ($request_cors = "OPTIONS_1") {
     add_header 'Access-Control-Allow-Methods' '${LIMIT_METHODS_TO_CSV}';
     #
     # Custom headers and headers various browsers *should* be OK with but aren't
+    # Bucket selection is internal and must not be advertised to browser clients.
     #
-    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range$s3_cors_bucket_header';
+    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range';
     #
     # Tell client that this pre-flight info is valid for 20 days
     #
@@ -38,7 +39,7 @@ if ($request_cors = "GET_1") {
     add_header 'Access-Control-Allow-Origin' '${CORS_ALLOWED_ORIGIN}' always;
     # Keep in sync with the OPTIONS_1 block above - see the comment there.
     add_header 'Access-Control-Allow-Methods' '${LIMIT_METHODS_TO_CSV}' always;
-    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range$s3_cors_bucket_header' always;
+    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range' always;
     add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
 }
 
@@ -46,6 +47,6 @@ if ($request_cors = "HEAD_1") {
     add_header 'Access-Control-Allow-Origin' '${CORS_ALLOWED_ORIGIN}' always;
     # Keep in sync with the OPTIONS_1 block above - see the comment there.
     add_header 'Access-Control-Allow-Methods' '${LIMIT_METHODS_TO_CSV}' always;
-    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range$s3_cors_bucket_header' always;
+    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range' always;
     add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
 }
